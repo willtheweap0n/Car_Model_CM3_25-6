@@ -1,0 +1,342 @@
+"""
+This code generates a fake 1400km route with elevation changes and mountains like lands end to john o groats would be, as a set of xyz coords. elevation
+change and horizontal distance is calculated, then all applied to an energy balance equation to find optimal cruising speed and most efficient energy consumption
+for route
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+
+class LongRouteOptimizer:
+    def __init__(self, car_params):
+        self.car_params = car_params
+        
+    def generate_1400km_route(self, points_per_km=2):
+        """Generate a realistic 1400km route with varied terrain"""
+        print("Generating 1400km route data...")
+        
+        total_distance = 1_400_000  # 1400km in meters
+        num_points = int(total_distance / 1000 * points_per_km)  # ~2800 points
+        
+        # Generate X coordinates (distance along route)
+        x = np.linspace(0, total_distance, num_points)
+        
+        # Generate Y coordinates (gentle road curvature)
+        y = 200 * np.sin(2 * np.pi * x / 500000) + 100 * np.sin(2 * np.pi * x / 200000)
+        
+        # Generate realistic elevation profile for long route
+        z = self._generate_long_route_elevation(x, total_distance)
+        
+        return np.column_stack([x, y, z])
+    
+    def _generate_long_route_elevation(self, x, total_distance):
+        """Generate elevation profile for a 1400km route with mountains, hills, plains"""
+        z_base = 200  # Start at 200m elevation
+        
+        # Major mountain ranges (long wavelength)
+        mountains1 = 800 * np.sin(2 * np.pi * (x - 200000) / 400000) * np.exp(-((x - 200000) / 150000)**2)
+        mountains2 = 600 * np.sin(2 * np.pi * (x - 700000) / 300000) * np.exp(-((x - 700000) / 120000)**2)
+        mountains3 = 400 * np.sin(2 * np.pi * (x - 1100000) / 350000) * np.exp(-((x - 1100000) / 140000)**2)
+        
+        # Rolling hills (medium wavelength)
+        hills1 = 150 * np.sin(2 * np.pi * x / 80000)
+        hills2 = 100 * np.sin(2 * np.pi * x / 40000)
+        
+        # Small terrain variations (short wavelength)
+        terrain = 50 * np.sin(2 * np.pi * x / 15000)
+        
+        # Add some plains (flatter sections)
+        plains_mask = ((x > 400000) & (x < 550000)) | ((x > 900000) & (x < 1050000))
+        plains_reduction = np.where(plains_mask, 0.3, 1.0)
+        
+        # Gentle overall slope upward
+        overall_slope = 0.0001 * x  # 100m elevation gain per 1000km
+        
+        # Combine all components
+        z = (z_base + mountains1 + mountains2 + mountains3 + 
+             hills1 * plains_reduction + hills2 * plains_reduction + 
+             terrain * plains_reduction + overall_slope)
+        
+        # Add realistic noise
+        z += 20 * np.random.randn(len(x))
+        
+        # Ensure minimum elevation
+        z = np.maximum(z, 50)
+        
+        return z
+    
+    def calculate_segment_properties(self, xyz_data, segment_length_km=1.0):
+        """Calculate segment properties with configurable segment length"""
+        print("Calculating segment properties...")
+        
+        segment_length_m = segment_length_km * 1000
+        segments = []
+        
+        # Create segments of approximately 1km each
+        current_segment_points = []
+        current_segment_start = 0
+        
+        for i in range(len(xyz_data)):
+            current_segment_points.append(xyz_data[i])
+            
+            # Check if we've reached segment length or end of data
+            segment_distance = xyz_data[i][0] - xyz_data[current_segment_start][0]
+            
+            if segment_distance >= segment_length_m or i == len(xyz_data) - 1:
+                if len(current_segment_points) >= 2:
+                    segment = self._create_segment_from_points(current_segment_points)
+                    segments.append(segment)
+                
+                # Start new segment
+                current_segment_points = [xyz_data[i]]
+                current_segment_start = i
+        
+        print(f"Created {len(segments)} segments of ~{segment_length_km}km each")
+        return segments
+    
+    def _create_segment_from_points(self, points):
+        """Create a segment from a list of points"""
+        points_array = np.array(points)
+        start_point = points_array[0]
+        end_point = points_array[-1]
+        
+        dx = end_point[0] - start_point[0]
+        dy = end_point[1] - start_point[1]
+        dz = end_point[2] - start_point[2]
+        
+        horizontal_distance = np.sqrt(dx**2 + dy**2)
+        segment_length = np.sqrt(dx**2 + dy**2 + dz**2)
+        
+        if horizontal_distance < 1e-6:
+            grade_angle = 0
+            grade_percent = 0
+        else:
+            grade_angle = np.arctan2(dz, horizontal_distance)
+            grade_percent = 100 * dz / horizontal_distance
+        
+        return {
+            'start_point': start_point,
+            'end_point': end_point,
+            'length': segment_length,
+            'horizontal_distance': horizontal_distance,
+            'elevation_change': dz,
+            'grade_angle': grade_angle,
+            'grade_percent': grade_percent,
+            'f_grade': self.car_params['m'] * 9.81 * np.sin(grade_angle),
+            'num_subpoints': len(points)
+        }
+    
+    def calculate_segment_fuel(self, segment, v_in, v_out):
+        """Calculate fuel energy for one segment using energy approach"""
+        L = segment['length']
+        Δz = segment['elevation_change']
+        
+        # Average speed for force calculations
+        v_avg = (v_in + v_out) / 2
+        
+        # Calculate forces
+        F_rr = self.car_params['C_rr'] * self.car_params['m'] * 9.81
+        F_aero = 0.5 * 1.225 * self.car_params['C_d'] * self.car_params['A'] * v_avg**2
+        
+        # Energy calculation (core equation)
+        E_resist = (F_rr + F_aero) * L
+        ΔKE = 0.5 * self.car_params['m'] * (v_out**2 - v_in**2)
+        ΔPE = self.car_params['m'] * 9.81 * Δz
+        
+        E_wheels_net = E_resist + ΔKE + ΔPE
+        
+        # Fuel logic with coasting
+        if E_wheels_net <= 0:
+            fuel_energy = 0
+            status = "COASTING"
+        else:
+            fuel_energy = E_wheels_net / self.car_params['eta']
+            status = "ENGINE"
+        
+        return {
+            'fuel_energy': fuel_energy,
+            'E_wheels_net': E_wheels_net,
+            'status': status,
+            'v_in': v_in,
+            'v_out': v_out,
+            'v_avg': v_avg
+        }
+    
+    def find_optimal_constant_speed(self, segments, v_range_kmh):
+        """Find the best constant speed for the entire route"""
+        print("Finding optimal speed...")
+        v_range_ms = v_range_kmh / 3.6
+        total_fuel = []
+        
+        for i, v in enumerate(v_range_ms):
+            if i % 10 == 0:  # Progress indicator
+                print(f"  Testing {v_range_kmh[i]:.0f} km/h...")
+                
+            segment_fuel = 0
+            for segment in segments:
+                result = self.calculate_segment_fuel(segment, v, v)
+                segment_fuel += result['fuel_energy']
+            total_fuel.append(segment_fuel)
+        
+        optimal_idx = np.argmin(total_fuel)
+        optimal_v = v_range_ms[optimal_idx]
+        min_fuel = total_fuel[optimal_idx]
+        
+        return optimal_v, min_fuel, total_fuel
+    
+    def analyze_route_economy(self, segments, optimal_v_ms):
+        """Analyze fuel economy for the entire route"""
+        total_fuel_joules = 0
+        coasting_segments = 0
+        total_distance = sum(seg['length'] for seg in segments)
+        
+        for segment in segments:
+            result = self.calculate_segment_fuel(segment, optimal_v_ms, optimal_v_ms)
+            total_fuel_joules += result['fuel_energy']
+            if result['status'] == 'COASTING':
+                coasting_segments += 1
+        
+        # Convert to practical units
+        fuel_energy_density = 34.2e6  # J/L for petrol
+        fuel_liters = total_fuel_joules / fuel_energy_density
+        fuel_economy = total_distance / 1000 / fuel_liters  # km/L
+        fuel_economy_100km = 100 / fuel_economy  # L/100km
+        
+        return {
+            'total_fuel_j': total_fuel_joules,
+            'fuel_liters': fuel_liters,
+            'fuel_economy_kmL': fuel_economy,
+            'fuel_economy_L100km': fuel_economy_100km,
+            'coasting_segments': coasting_segments,
+            'total_segments': len(segments),
+            'coasting_percentage': 100 * coasting_segments / len(segments)
+        }
+    
+    def plot_long_route_analysis(self, xyz_data, segments, v_range_kmh, fuel_results, economy):
+        """Plot comprehensive analysis for long route"""
+        fig = plt.figure(figsize=(16, 12))
+        
+        # Plot 1: Elevation profile
+        ax1 = plt.subplot(2, 2, 1)
+        distance_km = xyz_data[:, 0] / 1000
+        ax1.plot(distance_km, xyz_data[:, 2], 'b-', linewidth=1, alpha=0.8)
+        ax1.set_xlabel('Distance (km)')
+        ax1.set_ylabel('Elevation (m)')
+        ax1.set_title('1400km Route Elevation Profile')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xlim(0, 1400)
+        
+        # Plot 2: Grade profile (sampled)
+        ax2 = plt.subplot(2, 2, 2)
+        grades = [seg['grade_percent'] for seg in segments[::5]]  # Sample every 5th segment
+        distances = [seg['start_point'][0] / 1000 for seg in segments[::5]]
+        ax2.plot(distances, grades, 'r-', linewidth=0.5, alpha=0.7)
+        ax2.axhline(y=0, color='k', linestyle='-', alpha=0.3)
+        ax2.set_xlabel('Distance (km)')
+        ax2.set_ylabel('Grade (%)')
+        ax2.set_title('Road Grade Profile (Sampled)')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_ylim(-8, 8)
+        
+        # Plot 3: Fuel vs Speed
+        ax3 = plt.subplot(2, 2, 3)
+        ax3.plot(v_range_kmh, np.array(fuel_results) / 1e9, 'g-', linewidth=2, marker='o', markersize=3)
+        optimal_idx = np.argmin(fuel_results)
+        ax3.plot(v_range_kmh[optimal_idx], fuel_results[optimal_idx] / 1e9, 'ro', 
+                markersize=8, label=f'Optimal: {v_range_kmh[optimal_idx]:.1f} km/h')
+        ax3.set_xlabel('Speed (km/h)')
+        ax3.set_ylabel('Total Fuel Energy (GJ)')
+        ax3.set_title('Fuel Consumption vs Speed')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+        
+        # Plot 4: Economy summary
+        ax4 = plt.subplot(2, 2, 4)
+        categories = ['Fuel Economy', 'Coasting %']
+        values = [economy['fuel_economy_kmL'], economy['coasting_percentage']]
+        colors = ['blue', 'green']
+        
+        bars = ax4.bar(categories, values, color=colors, alpha=0.7)
+        ax4.set_ylabel('Value')
+        ax4.set_title(f'Route Performance Summary\nOptimal Speed: {v_range_kmh[optimal_idx]:.1f} km/h')
+        
+        # Add value labels on bars
+        for bar, value in zip(bars, values):
+            ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                    f'{value:.1f}', ha='center', va='bottom')
+        
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def run_1400km_analysis(self):
+        """Run complete analysis for 1400km route"""
+        # Generate 1400km route
+        xyz_data = self.generate_1400km_route(points_per_km=2)
+        
+        # Create segments (approximately 1km each)
+        segments = self.calculate_segment_properties(xyz_data, segment_length_km=1.0)
+        
+        # Route statistics
+        total_length = sum(seg['length'] for seg in segments)
+        total_elevation_gain = sum(max(seg['elevation_change'], 0) for seg in segments)
+        
+        print("=" * 60)
+        print("1400km ROUTE OPTIMIZATION ANALYSIS")
+        print("=" * 60)
+        print(f"Route Summary:")
+        print(f"  Total distance: {total_length/1000:.1f} km")
+        print(f"  Total segments: {len(segments)}")
+        print(f"  Total elevation gain: {total_elevation_gain:.0f} m")
+        print(f"  Avg segment length: {total_length/len(segments):.1f} m")
+        
+        # Test speed range optimized for long routes
+        v_range_kmh = np.linspace(60, 130, 30)  # 60-130 km/h range
+        
+        # Find optimal constant speed
+        optimal_v_ms, min_fuel, fuel_results = self.find_optimal_constant_speed(segments, v_range_kmh)
+        optimal_v_kmh = optimal_v_ms * 3.6
+        
+        # Analyze fuel economy
+        economy = self.analyze_route_economy(segments, optimal_v_ms)
+        
+        print(f"\nOptimization Results:")
+        print(f"  Optimal speed: {optimal_v_kmh:.1f} km/h")
+        print(f"  Fuel economy: {economy['fuel_economy_kmL']:.1f} km/L ({economy['fuel_economy_L100km']:.1f} L/100km)")
+        print(f"  Total fuel: {economy['fuel_liters']:.1f} L")
+        print(f"  Coasting segments: {economy['coasting_segments']}/{economy['total_segments']} ({economy['coasting_percentage']:.1f}%)")
+        
+        # Plot results
+        self.plot_long_route_analysis(xyz_data, segments, v_range_kmh, fuel_results, economy)
+        
+        return optimal_v_kmh, economy, segments
+
+# =============================================================================
+# MAIN EXECUTION FOR 1400km ROUTE
+# =============================================================================
+
+if __name__ == "__main__":
+    # Car parameters for long-distance travel
+    car_params = {
+        'm': 1500,      # mass (kg)
+        'C_rr': 0.010,  # lower rolling resistance for highway tires
+        'C_d': 0.28,    # aerodynamic car
+        'A': 2.1,       # frontal area (m²)
+        'eta': 0.32     # slightly better efficiency at highway speeds
+    }
+    
+    print("Starting 1400km Route Optimization")
+    print("This may take a minute for the long route...")
+    
+    # Create optimizer and run analysis
+    optimizer = LongRouteOptimizer(car_params)
+    optimal_speed, economy, segments = optimizer.run_1400km_analysis()
+    
+    # Save route data
+    np.savetxt('1400km_route_xyz.csv', optimizer.generate_1400km_route(), 
+               delimiter=',', header='x_m,y_m,z_m', comments='')
+    
+    print(f"\nAnalysis complete!")
+    print(f"Recommended cruising speed: {optimal_speed:.1f} km/h")
+    print(f"Expected fuel consumption: {economy['fuel_liters']:.0f} L total")
+    print(f"Fuel economy: {economy['fuel_economy_kmL']:.1f} km/L ({economy['fuel_economy_L100km']:.1f} L/100km)")
