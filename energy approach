@@ -1,0 +1,10 @@
+"""
+fuel consumption is the same as energy in to car. energy in to travel given segment is 
+work done against resistance forces.
+To use equation code must test build a gradient of a slope and a horizontal distance L, then test
+a range of speeds to optimise for the smallest E_fuel for that segment.
+E_fuel = (L*(C_rr*m*g + 0.5*rho*C_d*v^2) + m*g*deltaz)/nth(v). nth(v)= nth_engine*nth_drivetrain
+which can be found at speeds in BSFC map. not sure how to give this bsfc map to code though.
+"""
+
+
