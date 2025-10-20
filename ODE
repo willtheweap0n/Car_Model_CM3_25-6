@@ -1,0 +1,419 @@
+"""
+this code sets up an energy balance ode as the rate of change of fuel consumption, but spits out a bunch of weird stuff lol
+"""
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import root_scalar, minimize_scalar
+import matplotlib.pyplot as plt
+
+class EnergyODEOptimizer:
+    def __init__(self, car_params):
+        self.car_params = car_params
+        self.route_data = None
+        self.segments = []
+
+    def generate_route_profile(self, num_points=500, total_distance=50000, elevation_range=100):
+        """Generate realistic route with XYZ coordinates"""
+        print("Generating route data...")
+
+        # Generate X coordinates (linear progression along route)
+        x = np.linspace(0, total_distance, num_points)
+
+        # Generate Y coordinates (some gentle curvature)
+        y = 50 * np.sin(2 * np.pi * x / total_distance) + 30 * np.sin(4 * np.pi * x / total_distance)
+
+        # Generate realistic elevation profile
+        z_base = 100  # Start at 100m elevation
+        z_hill1 = 0.4 * elevation_range * np.sin(2 * np.pi * x / 10000)  # Long hills
+        z_hill2 = 0.3 * elevation_range * np.sin(2 * np.pi * x / 3000)   # Medium hills
+        z_hill3 = 0.2 * elevation_range * np.sin(2 * np.pi * x / 800)    # Short hills
+        z_noise = 5 * np.random.randn(len(x))  # Small random variations
+
+        z = z_base + z_hill1 + z_hill2 + z_hill3 + z_noise
+        z = np.maximum(z, 10)  # Ensure elevation stays positive
+
+        return np.column_stack([x, y, z])
+
+    def calculate_segment_properties(self, xyz_data):
+        """Calculate segment properties from XYZ data"""
+        segments = []
+
+        for i in range(len(xyz_data) - 1):
+            point_a = xyz_data[i]
+            point_b = xyz_data[i + 1]
+
+            dx = point_b[0] - point_a[0]
+            dy = point_b[1] - point_a[1]
+            dz = point_b[2] - point_a[2]
+
+            horizontal_distance = np.sqrt(dx**2 + dy**2)
+            segment_length = np.sqrt(dx**2 + dy**2 + dz**2)
+
+            if horizontal_distance < 1e-6:
+                grade_angle = 0
+                grade_percent = 0
+            else:
+                grade_angle = np.arctan2(dz, horizontal_distance)
+                grade_percent = 100 * dz / horizontal_distance
+
+            segments.append({
+                'start_point': point_a,
+                'end_point': point_b,
+                'length': segment_length,
+                'horizontal_distance': horizontal_distance,
+                'elevation_change': dz,
+                'grade_angle': grade_angle,
+                'grade_percent': grade_percent,
+                'f_grade': self.car_params['m'] * 9.81 * np.sin(grade_angle),
+                'start_distance': point_a[0],
+                'end_distance': point_b[0]
+            })
+
+        return segments
+
+    def set_route_data(self, xyz_data):
+        """Set real route data for grade calculations"""
+        self.route_data = xyz_data
+        self.segments = self.calculate_segment_properties(xyz_data)
+        print(f"Route data set with {len(self.segments)} segments")
+
+    def get_grade_at_distance(self, distance):
+        """Get road grade at specific distance (for ODE)"""
+        # Find appropriate segment
+        for segment in self.segments:
+            if segment['start_distance'] <= distance <= segment['end_distance']:
+                return segment['f_grade']
+
+        # If beyond route, return last segment's grade or 0
+        if self.segments:
+            return self.segments[-1]['f_grade']
+        return 0  # Default to flat
+
+    def vehicle_dynamics_energy(self, t, state, power_strategy='constant', target_power=30000):
+        """
+        ODE system using energy approach
+        state: [distance, speed, cumulative_fuel_energy]
+        """
+        s, v, E_fuel = state
+
+        if v < 0.1:  # Avoid division by zero
+            v = 0.1
+
+        # Get current road grade
+        F_grade = self.get_grade_at_distance(s)
+
+        # Resistive forces
+        F_rr = self.car_params['C_rr'] * self.car_params['m'] * 9.81
+        F_aero = 0.5 * 1.225 * self.car_params['C_d'] * self.car_params['A'] * v**2
+        F_total = F_rr + F_aero + F_grade
+
+        # Power strategy
+        if power_strategy == 'constant':
+            P_engine = target_power
+        elif power_strategy == 'optimal':
+            # Use optimal power from root finding
+            P_engine = self.find_optimal_power(s, v, F_total)
+        else:
+            P_engine = target_power
+
+        # Power balance: d(KE)/dt = P_engine - P_losses
+        P_losses = F_total * v
+        net_power = P_engine - P_losses
+
+        # Coasting logic
+        if net_power < -1000 and v > 5:  # Coasting threshold
+            P_engine_actual = 0
+            # Recalculate net power for coasting
+            net_power = -P_losses  # Only losses act on vehicle
+        else:
+            P_engine_actual = P_engine
+
+        # Acceleration from energy balance: d(½mv²)/dt = net_power
+        if v > 0.1:
+            dvdt = net_power / (self.car_params['m'] * v)
+        else:
+            dvdt = 0
+
+        # Rates of change
+        dsdt = v  # Distance
+        dEdt = P_engine_actual / self.car_params['eta']  # Fuel energy rate
+
+        return [dsdt, dvdt, dEdt]
+
+    def find_optimal_power(self, distance, current_v, F_total):
+        """Root finding to determine optimal power for current conditions"""
+        def power_objective(P_engine):
+            # Objective: balance fuel efficiency and speed maintenance
+            if P_engine < 0:
+                return 1e9  # Large penalty for negative power
+
+            # Calculate resulting speed (simplified)
+            P_losses = F_total * current_v
+            net_power = P_engine - P_losses
+
+            if net_power > 0:
+                # Fuel rate + penalty for deviating from efficient speed
+                fuel_cost = P_engine / (self.car_params['eta'] * 42.6e6)
+                speed_penalty = 0.01 * abs(current_v - 25)**2  # Prefer ~90 km/h
+                return fuel_cost + speed_penalty
+            else:
+                return 1e9  # Can't maintain speed
+
+        # Find power that minimizes objective
+        result = minimize_scalar(power_objective, bounds=(1000, 80000), method='bounded')
+        return result.x if result.success else 30000
+
+    def solve_route_ode(self, initial_speed, power_strategy='constant', target_power=30000, duration=3600):
+        """Solve ODE for entire route"""
+        initial_state = [0, initial_speed, 0]  # [distance, speed, fuel_energy]
+
+        print(f"Solving ODE with {power_strategy} power strategy...")
+
+        solution = solve_ivp(
+            self.vehicle_dynamics_energy,
+            [0, duration],
+            initial_state,
+            args=(power_strategy, target_power),
+            method='RK45',
+            max_step=5,
+            dense_output=True,
+            rtol=1e-6
+        )
+
+        print(f"ODE solved successfully. Final distance: {solution.y[0][-1]:.0f}m")
+        return solution
+
+    def calculate_segment_fuel(self, segment, v_in, v_out):
+        """Energy-based fuel calculation for a segment"""
+        L = segment['length']
+        Δz = segment['elevation_change']
+
+        # Average speed for force calculations
+        v_avg = (v_in + v_out) / 2
+
+        # Calculate forces
+        F_rr = self.car_params['C_rr'] * self.car_params['m'] * 9.81
+        F_aero = 0.5 * 1.225 * self.car_params['C_d'] * self.car_params['A'] * v_avg**2
+        F_grade = segment['f_grade']
+
+        # Energy calculation
+        E_resist = (F_rr + F_aero + F_grade) * L
+        ΔKE = 0.5 * self.car_params['m'] * (v_out**2 - v_in**2)
+        ΔPE = self.car_params['m'] * 9.81 * Δz
+
+        E_wheels_net = E_resist + ΔKE + ΔPE
+
+        # Fuel logic with coasting
+        if E_wheels_net <= 0:
+            fuel_energy = 0
+            status = "COASTING"
+        else:
+            fuel_energy = E_wheels_net / self.car_params['eta']
+            status = "ENGINE"
+
+        return {
+            'fuel_energy': fuel_energy,
+            'E_wheels_net': E_wheels_net,
+            'status': status,
+            'v_in': v_in,
+            'v_out': v_out
+        }
+
+    def optimize_speed_profile_root_finding(self):
+        """Use root finding to optimize speed segment by segment"""
+        print("Optimizing speed profile using root finding...")
+
+        optimal_speeds = []
+        current_speed = 20.0  # Initial guess in m/s
+
+        for i, segment in enumerate(self.segments):
+            if i % 100 == 0:
+                print(f"  Segment {i}/{len(self.segments)}")
+
+            def segment_fuel_objective(v):
+                # Fuel consumption for this segment at speed v
+                result = self.calculate_segment_fuel(segment, v, v)
+                return result['fuel_energy']
+
+            # Find speed that minimizes fuel for this segment
+            result = minimize_scalar(
+                segment_fuel_objective,
+                bounds=(5, 35),  # 18-126 km/h
+                method='bounded'
+            )
+
+            if result.success:
+                optimal_speeds.append(result.x)
+                current_speed = result.x
+            else:
+                optimal_speeds.append(current_speed)
+
+        return optimal_speeds
+
+    def plot_ode_solutions(self, solutions, labels):
+        """Plot ODE solutions for different strategies"""
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+
+        colors = ['blue', 'red', 'green', 'orange']
+
+        for i, (sol, label) in enumerate(zip(solutions, labels)):
+            color = colors[i % len(colors)]
+
+            # Plot speed vs distance
+            ax1.plot(sol.y[0] / 1000, sol.y[1] * 3.6, label=label,
+                    linewidth=2, color=color)
+
+            # Plot acceleration
+            if len(sol.t) > 1:
+                acceleration = np.gradient(sol.y[1], sol.t)
+                ax2.plot(sol.y[0] / 1000, acceleration, label=label,
+                        linewidth=2, color=color)
+
+            # Plot fuel consumption
+            ax3.plot(sol.y[0] / 1000, sol.y[2] / 1e9, label=label,
+                    linewidth=2, color=color)
+
+            # Plot power requirements
+            power = []
+            for j in range(len(sol.t)):
+                F_grade = self.get_grade_at_distance(sol.y[0][j])
+                F_rr = self.car_params['C_rr'] * self.car_params['m'] * 9.81
+                F_aero = 0.5 * 1.225 * self.car_params['C_d'] * self.car_params['A'] * sol.y[1][j]**2
+                P_loss = (F_rr + F_aero + F_grade) * sol.y[1][j]
+                power.append(P_loss / 1000)  # kW
+
+            ax4.plot(sol.y[0] / 1000, power, label=label,
+                    linewidth=2, color=color)
+
+        ax1.set_xlabel('Distance (km)')
+        ax1.set_ylabel('Speed (km/h)')
+        ax1.set_title('Speed Profile')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        ax2.set_xlabel('Distance (km)')
+        ax2.set_ylabel('Acceleration (m/s²)')
+        ax2.set_title('Acceleration Profile')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+        ax3.set_xlabel('Distance (km)')
+        ax3.set_ylabel('Fuel Energy (GJ)')
+        ax3.set_title('Cumulative Fuel Consumption')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+
+        ax4.set_xlabel('Distance (km)')
+        ax4.set_ylabel('Power (kW)')
+        ax4.set_title('Power Requirements')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    def plot_route_profile(self):
+        """Plot the route elevation profile"""
+        if self.route_data is None:
+            print("No route data available")
+            return
+
+        plt.figure(figsize=(12, 4))
+        plt.plot(self.route_data[:, 0] / 1000, self.route_data[:, 2], 'b-', linewidth=1)
+        plt.xlabel('Distance (km)')
+        plt.ylabel('Elevation (m)')
+        plt.title('Route Elevation Profile')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    # Car parameters
+    car_params = {
+        'm': 1500,      # mass (kg)
+        'C_rr': 0.012,  # rolling resistance coefficient
+        'C_d': 0.30,    # drag coefficient
+        'A': 2.2,       # frontal area (m²)
+        'eta': 0.30     # efficiency
+    }
+
+    print("=" * 60)
+    print("ENERGY-BASED ODE OPTIMIZATION WITH ROOT FINDING")
+    print("=" * 60)
+
+    # Create optimizer
+    optimizer = EnergyODEOptimizer(car_params)
+
+    # Generate route data
+    print("Generating route...")
+    xyz_data = optimizer.generate_route_profile(num_points=300, total_distance=50000)
+    optimizer.set_route_data(xyz_data)
+
+    # Plot route profile
+    optimizer.plot_route_profile()
+
+    # Solve ODE with different strategies
+    print("\n1. SOLVING ODE SYSTEMS...")
+
+    # Strategy 1: Constant power
+    sol_constant = optimizer.solve_route_ode(
+        initial_speed=20,  # 72 km/h
+        power_strategy='constant',
+        target_power=35000,  # 35 kW
+        duration=1800  # 30 minutes
+    )
+
+    # Strategy 2: Optimal power (using root finding)
+    sol_optimal = optimizer.solve_route_ode(
+        initial_speed=20,
+        power_strategy='optimal',
+        duration=1800
+    )
+
+    # Strategy 3: Lower constant power
+    sol_low_power = optimizer.solve_route_ode(
+        initial_speed=20,
+        power_strategy='constant',
+        target_power=20000,  # 20 kW
+        duration=1800
+    )
+
+    print("\n2. PERFORMING ROOT FINDING OPTIMIZATION...")
+    optimal_speeds = optimizer.optimize_speed_profile_root_finding()
+
+    print(f"\nRoot finding completed. Found optimal speeds for {len(optimal_speeds)} segments")
+    print(f"Average optimal speed: {np.mean(optimal_speeds)*3.6:.1f} km/h")
+
+    # Plot results
+    print("\n3. PLOTTING RESULTS...")
+    optimizer.plot_ode_solutions(
+        [sol_constant, sol_optimal, sol_low_power],
+        ['Constant Power (35 kW)', 'Optimal Power', 'Low Power (20 kW)']
+    )
+
+    # Final results
+    print("\n" + "=" * 60)
+    print("FINAL RESULTS")
+    print("=" * 60)
+    print(f"Constant Power (35 kW):")
+    print(f"  Final distance: {sol_constant.y[0][-1]/1000:.1f} km")
+    print(f"  Final speed: {sol_constant.y[1][-1]*3.6:.1f} km/h")
+    print(f"  Total fuel: {sol_constant.y[2][-1]/1e9:.3f} GJ")
+
+    print(f"\nOptimal Power:")
+    print(f"  Final distance: {sol_optimal.y[0][-1]/1000:.1f} km")
+    print(f"  Final speed: {sol_optimal.y[1][-1]*3.6:.1f} km/h")
+    print(f"  Total fuel: {sol_optimal.y[2][-1]/1e9:.3f} GJ")
+
+    print(f"\nLow Power (20 kW):")
+    print(f"  Final distance: {sol_low_power.y[0][-1]/1000:.1f} km")
+    print(f"  Final speed: {sol_low_power.y[1][-1]*3.6:.1f} km/h")
+    print(f"  Total fuel: {sol_low_power.y[2][-1]/1e9:.3f} GJ")
+
+    # Calculate fuel savings
+    fuel_savings = (sol_constant.y[2][-1] - sol_optimal.y[2][-1]) / sol_constant.y[2][-1] * 100
+    print(f"\nFuel savings with optimal strategy: {fuel_savings:.1f}%")
