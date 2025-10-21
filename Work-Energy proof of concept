@@ -1,0 +1,65 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# For simplicity, velocity constant
+velocity = 30 #m/s
+
+# -----Car properties-----
+mass = 1000 #kg
+frontal_area = 1 #m^2
+c_d = 1.05 # Drag for cube
+c_rr = 0.01 # Rolling resistance coefficient
+length = 2 # It appears to be length that matters for flow past bluff body
+g = 9.81 #m/s^2
+wetted_area = 6 # Total area in contact with air. 6 m^2 for a cube
+
+# -----Air properties-----
+p_air = 1.225 #kg/m^3
+viscosity = 1.8e-5 #kg/ms
+Re = (p_air * velocity * length) / viscosity
+#print("Reynolds number:", Re)
+
+if Re >= 2e5:
+    # Turbulent flow
+    c_f = 0.074 / (Re**(1/5))
+elif Re <= 1e5:
+    # Laminar flow
+    c_f = 1.4 / (Re**(1/2))
+else:
+    # This is what copilot said. I have no clue what to do when 1e5 < Re < 2e5. This is better than nothing I guess.
+    # Transitional flow, interpolate between laminar and turbulent
+    c_f_laminar = 1.4 / (1e5**(1/2))
+    c_f_turbulent = 0.074 / (2e5**(1/5))
+    c_f = c_f_laminar + (c_f_turbulent - c_f_laminar) * ((Re - 1e5) / (2e5 - 1e5))
+
+# Initialise sim
+N = 1000
+s = np.linspace(0, 1000, N)
+
+# Run sim
+
+# Rolling resistance force
+weight = mass * g
+F_normal = weight # Flat road
+F_rr = c_rr * F_normal
+
+ds = np.diff(s)
+
+# Drag forces
+
+# Probably use cumsum of velocities. With final velocity from previous segment used for drag force of current segment
+# Could also maybe integrate it as velocity changes, but that is more work
+F_drag = 0.5 * p_air * c_d * frontal_area * velocity**2
+F_skin = 0.5 * p_air * c_f * wetted_area * velocity**2
+#print(f"Drag: {F_drag}, Skin friction: {F_skin}, Rolling resistance: {F_rr}")
+
+F_total = F_drag + F_skin + F_rr
+
+# Probably integrate for work too
+work = np.cumsum(F_total * np.concatenate(([0], ds))) # 0 at first point because no distance travelled yet
+plt.plot(s, work)
+#plt.xlim(0, s[-1])   # Prevent empty space on left
+#plt.ylim(0, max(work)) # Prevent empty space on right
+plt.xlabel('Distance (m)')
+plt.ylabel('Work done(J)')
+plt.show()
