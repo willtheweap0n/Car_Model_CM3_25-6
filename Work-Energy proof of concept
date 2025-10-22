@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-# For simplicity, velocity constant
+# For simplicity, velocity constant as that's not what I'm testing here
 velocity = 30 #m/s
 
 # -----Car properties-----
