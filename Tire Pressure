@@ -1,0 +1,143 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 1. Empirical Data + Manual Regression (Interpolation)
+# ============================================================
+
+# Simulated data (Pressure vs Rolling Resistance Coefficient)
+P_data = np.array([28, 30, 32, 34, 36])
+Cr_data = np.array([0.014, 0.013, 0.012, 0.0125, 0.0135])  # U-shape curve
+
+# Manual quadratic regression (no sklearn)
+# Fit C_r = a*P^2 + b*P + c using normal equations
+A = np.vstack([P_data**2, P_data, np.ones_like(P_data)]).T
+coeffs = np.linalg.inv(A.T @ A) @ A.T @ Cr_data
+a, b, c = coeffs
+
+def rolling_resistance(P):
+    """Interpolated rolling resistance coefficient C_r(P)."""
+    return a*P**2 + b*P + c
+
+# ============================================================
+# 2. Tire Temperature–Pressure Dynamics (ODEs)
+# ============================================================
+
+def tire_odes(t, state, v, T_air=25):
+    """
+    ODEs for tire pressure (P) and temperature (T).
+    """
+    P, T = state
+    # constants
+    k1, k2, k3, k4, k5 = 1e-3, 1e-4, 5e-5, 2e-5, 5e-3
+    P_leak = 26.0
+    P_amb = 28.0
+
+    dTdt = k3*(P - P_amb)**2 + k4*v**2 - k5*(T - T_air)
+    dPdt = k1*(T - T_air) - k2*(P - P_leak)
+    return np.array([dPdt, dTdt])
+
+# Simple ODE solver (Euler integration)
+def integrate_ode(f, y0, t_span, dt, *args):
+    t0, tf = t_span
+    t = np.arange(t0, tf, dt)
+    y = np.zeros((len(t), len(y0)))
+    y[0] = y0
+    for i in range(1, len(t)):
+        y[i] = y[i-1] + dt * f(t[i-1], y[i-1], *args)
+    return t, y
+
+# ============================================================
+# 3. Root Finding (Manual Newton–Raphson)
+# ============================================================
+
+def newton_root(func, x0, tol=1e-6, max_iter=50):
+    """Manual Newton–Raphson root finder."""
+    x = x0
+    for i in range(max_iter):
+        fx = func(x)
+        dfx = (func(x + 1e-6) - fx) / 1e-6
+        if abs(dfx) < 1e-8:
+            break
+        x_new = x - fx/dfx
+        if abs(x_new - x) < tol:
+            return x_new
+        x = x_new
+    return x
+
+# Equilibrium function: steady-state pressure (dP/dt = 0, dT/dt = 0)
+def equilibrium_pressure(v):
+    def f(P):
+        # Simplified steady-state relationship (from ODE balance)
+        T_steady = 25 + 10*np.exp(-((P-32)/3)**2) + 0.01*v**2
+        dPdt = (1e-3)*(T_steady - 25) - (1e-4)*(P - 26)
+        return dPdt
+    return newton_root(f, 32.0)
+
+# ============================================================
+# 4. Fuel Consumption Model
+# ============================================================
+
+def fuel_consumption(P, v, m=1500, Cd=0.3, A=2.2, rho=1.225):
+    """
+    Estimate fuel use (L/100km) from rolling resistance and aero drag.
+    """
+    C_r = rolling_resistance(P)
+    F_roll = m * 9.81 * C_r
+    F_drag = 0.5 * rho * Cd * A * v**2
+    P_drive = (F_roll + F_drag) * v
+    fc = 7.0 * (P_drive / (F_roll * v + 1)) / 1e5  # scaled empirical relation
+    return fc
+
+# ============================================================
+# 5. Optimiser Loop
+# ============================================================
+
+def optimise_pressure(v):
+    """Optimise steady-state tire pressure for given speed."""
+    pressures = np.linspace(28, 36, 100)
+    fuel_vals = np.zeros_like(pressures)
+    for i, P in enumerate(pressures):
+        fuel_vals[i] = fuel_consumption(P, v)
+    opt_idx = np.argmin(fuel_vals)
+    return pressures[opt_idx], fuel_vals[opt_idx], pressures, fuel_vals
+
+# ============================================================
+# 6. Simulation
+# ============================================================
+
+v = 25  # m/s (~90 km/h)
+P_eq = equilibrium_pressure(v)
+
+# Simulate ODE for warm-up phase
+t, y = integrate_ode(tire_odes, [30.0, 25.0], (0, 600), 1.0, v)
+P_vals, T_vals = y[:,0], y[:,1]
+
+# Optimise pressure for fuel economy
+P_opt, f_opt, Ps, F_vals = optimise_pressure(v)
+
+# ============================================================
+# 7. Results and Visualisation
+# ============================================================
+
+print(f"Equilibrium (steady-state) pressure ≈ {P_eq:.2f} psi")
+print(f"Fuel-optimal pressure ≈ {P_opt:.2f} psi at {v:.1f} m/s")
+
+plt.figure(figsize=(10,5))
+plt.subplot(1,2,1)
+plt.plot(t, P_vals, label="Pressure (psi)")
+plt.plot(t, T_vals, label="Temperature (°C)")
+plt.axhline(P_eq, color='r', linestyle='--', label='Equilibrium Pressure')
+plt.title("Tire Pressure–Temperature ODE Simulation")
+plt.xlabel("Time (s)")
+plt.legend(); plt.grid(True)
+
+plt.subplot(1,2,2)
+plt.plot(Ps, F_vals, label="Fuel consumption (L/100 km)")
+plt.axvline(P_opt, color='r', linestyle='--', label=f"Optimum {P_opt:.2f} psi")
+plt.xlabel("Pressure (psi)")
+plt.ylabel("Fuel consumption (L/100 km)")
+plt.title("Fuel Consumption vs Tire Pressure")
+plt.legend(); plt.grid(True)
+plt.tight_layout()
+plt.show()
