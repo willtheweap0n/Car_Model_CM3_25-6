@@ -1,0 +1,28 @@
+import pandas as pd
+import numpy as np
+from scipy.spatial import cKDTree
+
+# Load both datasets
+df_dense = pd.read_csv("osrm_ors_route_highres.csv")   # many points, no elevation
+df_sparse = pd.read_csv("ors_route_fastest.csv")        # fewer points, with elevation
+
+# Keep only points that have elevation
+df_sparse = df_sparse.dropna(subset=["elev_m"])
+
+# Build a KD-tree for fast nearest-neighbor search
+tree = cKDTree(df_sparse[["lon", "lat"]].values)
+
+# For each dense point, find the nearest sparse (elevation) point
+distances, indices = tree.query(df_dense[["lon", "lat"]].values, k=1)
+
+# Assign interpolated elevation
+df_dense["elev_m"] = df_sparse.iloc[indices]["elev_m"].values
+
+# Optional: smooth elevations to remove step changes (simple moving average)
+df_dense["elev_m"] = df_dense["elev_m"].rolling(window=5, center=True, min_periods=1).mean()
+
+# Save the combined high-resolution dataset
+df_dense.to_csv("final_route_highres_elevation.csv", index=False)
+
+print(f"✅ Combined dataset saved with {len(df_dense)} points.")
+print(df_dense.head())
