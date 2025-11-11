@@ -1,0 +1,381 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d, RectBivariateSpline
+from scipy.optimize import minimize_scalar
+from scipy.integrate import solve_ivp
+import math
+import time
+
+# --- 1. CONFIGURATION (Constants & Vehicle Data) ---
+# Physics Constants
+GRAVITY_MPS2 = 9.81
+AIR_DENSITY_KGM3 = 1.225
+FUEL_DENSITY_GPL = 743.0
+EARTH_RADIUS_M = 6371000
+
+# Vehicle Parameters
+VEHICLE_MASS_KG = 1400.0
+FRONTAL_AREA_M2 = 2.2
+DRAG_COEFFICIENT = 0.3
+ROLLING_RESISTANCE_COEFFICIENT = 0.015
+
+# Drivetrain: Gears are now fixed, Final Drive is our variable
+FIXED_GEAR_RATIOS_LIST = [3.70, 1.95, 1.30, 1.03, 0.84, 0.68]
+BASE_FINAL_DRIVE_RATIO = 3.85 # This is our initial guess
+TIRE_RADIUS_M = 0.323
+MIN_ENGINE_RPM = 800.0
+MAX_ENGINE_RPM = 6800.0
+
+# --- 2. CORE ENGINE MODEL (INTERPOLATION) ---
+(get_fuel_flow, get_max_torque, get_min_torque) = (None, None, None)
+
+def setup_engine_model():
+    """
+    Loads all EPA log data and returns interpolation functions.
+    (This function is identical to the previous script)
+    """
+    global get_fuel_flow, get_max_torque, get_min_torque
+    
+    speed_rads_axis = np.array([
+        0.0, 36.6, 77.9, 88.7, 96.6, 104.6, 131.2, 156.9, 182.5, 
+        209.3, 259.3, 310.9, 363.7, 415.8, 470.8, 562.9, 654.5, 680.7
+    ])
+    torque_nm_axis = np.array([
+        -39.9, -37.9, -22.2, 2.2, 9.7, 19.4, 29.6, 39.7, 44.7, 49.6, 
+        59.7, 69.6, 79.6, 89.7, 99.5, 109.8, 119.6, 129.5, 138.6, 
+        150.3, 169.7, 183.1, 195.9, 211.5
+    ])
+    fuel_gps_map = np.array([
+        [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.06,0.09],
+        [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.01,0.12,0.15],
+        [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.01,0.03,0.06,0.09,0.17,0.29,0.45,0.61,0.66],
+        [0.02,0.07,0.12,0.13,0.14,0.15,0.19,0.22,0.26,0.30,0.37,0.47,0.59,0.71,0.86,1.13,1.39,1.47],
+        [0.03,0.08,0.15,0.16,0.18,0.19,0.24,0.28,0.33,0.38,0.47,0.58,0.72,0.86,1.04,1.34,1.64,1.72],
+        [0.04,0.11,0.19,0.21,0.23,0.24,0.30,0.35,0.42,0.48,0.59,0.72,0.88,1.06,1.28,1.62,1.95,2.05],
+        [0.05,0.14,0.24,0.26,0.28,0.30,0.36,0.43,0.50,0.58,0.71,0.87,1.07,1.30,1.53,1.91,2.29,2.40],
+        [0.06,0.16,0.28,0.31,0.33,0.35,0.43,0.50,0.58,0.67,0.84,1.02,1.26,1.53,1.77,2.21,2.64,2.76],
+        [0.06,0.17,0.29,0.33,0.35,0.37,0.46,0.54,0.63,0.72,0.90,1.10,1.36,1.64,1.90,2.35,2.81,2.94],
+        [0.06,0.18,0.31,0.35,0.37,0.40,0.49,0.58,0.67,0.77,0.97,1.18,1.45,1.75,2.02,2.50,2.97,3.11],
+        [0.06,0.20,0.35,0.39,0.42,0.45,0.55,0.66,0.76,0.87,1.10,1.35,1.64,1.97,2.28,2.80,3.32,3.47],
+        [0.07,0.22,0.39,0.44,0.47,0.51,0.62,0.74,0.86,0.99,1.24,1.52,1.83,2.18,2.53,3.09,3.67,3.84],
+        [0.08,0.25,0.44,0.49,0.53,0.57,0.69,0.82,0.96,1.11,1.38,1.68,2.03,2.40,2.78,3.39,4.03,4.21],
+        [0.10,0.28,0.50,0.55,0.59,0.63,0.77,0.92,1.07,1.23,1.53,1.85,2.22,2.62,3.02,3.70,4.40,4.61],
+        [0.12,0.32,0.56,0.62,0.66,0.71,0.86,1.01,1.17,1.34,1.67,2.01,2.42,2.84,3.26,4.00,4.77,4.99],
+        [0.15,0.37,0.63,0.69,0.74,0.79,0.95,1.11,1.28,1.48,1.82,2.19,2.63,3.07,3.52,4.33,5.17,5.41],
+        [0.19,0.43,0.70,0.77,0.83,0.88,1.06,1.23,1.39,1.57,1.96,2.36,2.84,3.30,3.78,4.64,5.55,5.81],
+        [0.23,0.49,0.79,0.86,0.92,0.98,1.18,1.37,1.54,1.71,2.10,2.55,3.03,3.52,4.04,4.98,5.95,6.23],
+        [0.28,0.56,0.87,0.95,1.01,1.07,1.28,1.48,1.67,1.84,2.24,2.72,3.22,3.73,4.29,5.31,6.32,6.61],
+        [0.34,0.64,0.99,1.07,1.14,1.20,1.41,1.61,1.81,2.02,2.46,2.95,3.47,4.03,4.65,5.74,6.81,7.12],
+        [0.42,0.79,1.20,1.31,1.39,1.47,1.73,1.97,2.20,2.39,2.98,3.50,4.02,4.69,5.41,6.55,7.65,7.96],
+        [0.47,0.88,1.35,1.48,1.57,1.66,1.96,2.25,2.54,2.84,3.50,4.02,4.67,5.32,6.02,7.15,8.24,8.55],
+        [0.50,0.97,1.50,1.64,1.74,1.84,2.18,2.51,2.85,3.20,3.85,4.47,5.28,5.97,6.64,7.74,8.81,9.11],
+        [0.54,1.08,1.68,1.84,1.95,2.07,2.46,2.84,3.21,3.60,4.32,5.10,5.94,6.70,7.42,8.48,9.51,9.80]
+    ])
+    
+    rads_to_rpm = 60 / (2 * np.pi)
+    wot_speed_rads=np.array([0.0,95.0,157.2,178.0,209.5,235.7,256.4,282.7,314.1,356.1,429.4,628.3,680.7])
+    wot_torque_nm=np.array([0.0,134.6,164.9,167.8,187.9,188.3,182.3,188.2,201.4,197.4,200.1,184.0,0.0])
+    ct_speed_rads=np.array([0.0,146.6,403.2,424.0,465.8,680.7])
+    ct_torque_nm=np.array([-16.0,-20.6,-28.8,-33.5,-35.0,-42.7])
+    
+    _get_fuel_flow = RectBivariateSpline(torque_nm_axis, speed_rads_axis, fuel_gps_map, kx=1, ky=1)
+    _get_max_torque = interp1d(wot_speed_rads * rads_to_rpm, wot_torque_nm, kind='linear', bounds_error=False, fill_value=0.0)
+    _get_min_torque = interp1d(ct_speed_rads * rads_to_rpm, ct_torque_nm, kind='linear', bounds_error=False, fill_value=-16.0)
+
+    def get_fuel_flow_gps(rpm, torque):
+        rads = rpm * (2 * np.pi / 60)
+        torque_clipped = np.clip(torque, torque_nm_axis[0], torque_nm_axis[-1])
+        rads_clipped = np.clip(rads, speed_rads_axis[0], speed_rads_axis[-1])
+        return _get_fuel_flow(torque_clipped, rads_clipped)[0][0]
+
+    get_fuel_flow = get_fuel_flow_gps
+    get_max_torque = _get_max_torque
+    get_min_torque = _get_min_torque
+    print("Engine model setup complete.")
+
+# --- 3. CORE PHYSICS & ROUTE FUNCTIONS ---
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance between two lat/lon points in meters."""
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    lat1 = math.radians(lat1)
+    lat2 = math.radians(lat2)
+    a = math.sin(dLat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dLon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return EARTH_RADIUS_M * c
+
+def get_engine_rpm_from_speed(speed_mps, gear_ratio, final_drive):
+    if TIRE_RADIUS_M == 0: return 0
+    wheel_rpm = (speed_mps / (2 * math.pi * TIRE_RADIUS_M)) * 60
+    engine_rpm = wheel_rpm * gear_ratio * final_drive
+    return max(MIN_ENGINE_RPM, engine_rpm)
+
+def calculate_resistance_forces(speed_mps, slope_percent):
+    f_drag = 0.5 * AIR_DENSITY_KGM3 * FRONTAL_AREA_M2 * DRAG_COEFFICIENT * (speed_mps ** 2)
+    f_rolling = ROLLING_RESISTANCE_COEFFICIENT * VEHICLE_MASS_KG * GRAVITY_MPS2
+    slope_angle_rad = math.atan(slope_percent / 100.0)
+    f_gravity = VEHICLE_MASS_KG * GRAVITY_MPS2 * math.sin(slope_angle_rad)
+    return f_drag + f_rolling + f_gravity
+
+# --- 4. NEW ROUTE PRE-PROCESSING ---
+
+# Mock route: [lat, lon, elevation_m, speed_limit_kmh]
+MOCK_ROUTE_DATA = [
+    [55.95, -3.18, 50, 50],   # Start in city (Edinburgh)
+    [55.90, -3.20, 100, 100], # Highway entrance (uphill)
+    [55.70, -3.30, 250, 100], # Highway cruising (more uphill)
+    [55.50, -3.40, 150, 100], # Highway cruising (downhill)
+    [55.45, -3.42, 100, 50],  # Exit highway into town
+    [55.43, -3.43, 100, 50]   # End of route
+]
+
+# Globals to hold our pre-processed route
+route_dist_interpolator = None
+route_slope_interpolator = None
+route_speed_limit_interpolator = None
+total_route_distance_m = 0.0
+
+def preprocess_route():
+    """
+    Processes the MOCK_ROUTE_DATA into interpolators vs. distance.
+    This creates the "Slope Profile" and "Speed Limit Profile".
+    """
+    global route_dist_interpolator, route_slope_interpolator
+    global route_speed_limit_interpolator, total_route_distance_m
+    
+    print("Pre-processing GIS route data...")
+    
+    distances_m = [0.0]
+    slopes_pct = [0.0]
+    speed_limits_mps = [MOCK_ROUTE_DATA[0][3] / 3.6]
+    
+    current_distance_m = 0.0
+    
+    for i in range(len(MOCK_ROUTE_DATA) - 1):
+        p1 = MOCK_ROUTE_DATA[i]
+        p2 = MOCK_ROUTE_DATA[i+1]
+        
+        # Calculate distance for this segment
+        seg_dist_m = haversine_distance(p1[0], p1[1], p2[0], p2[1])
+        if seg_dist_m < 0.1: continue # Skip duplicate points
+        
+        # Calculate slope for this segment
+        elev_change_m = p2[2] - p1[2]
+        seg_slope_pct = (elev_change_m / seg_dist_m) * 100.0
+        
+        # Speed limit *applies from the start* of this segment
+        seg_speed_limit_mps = p1[3] / 3.6
+        
+        current_distance_m += seg_dist_m
+        
+        distances_m.append(current_distance_m)
+        slopes_pct.append(seg_slope_pct)
+        speed_limits_mps.append(seg_speed_limit_mps)
+        
+    total_route_distance_m = current_distance_m
+    
+    # Create interpolators (vs. distance)
+    # 'previous' kind means the value holds until the next point
+    route_dist_interpolator = interp1d(distances_m, distances_m, kind='linear', fill_value="extrapolate")
+    route_slope_interpolator = interp1d(distances_m, slopes_pct, kind='previous', fill_value="extrapolate")
+    route_speed_limit_interpolator = interp1d(distances_m, speed_limits_mps, kind='previous', fill_value="extrapolate")
+
+    print(f"Route pre-processed. Total distance: {total_route_distance_m/1000.0:.1f} km")
+
+# --- 5. DYNAMIC SIMULATOR (ODE) ---
+
+# Pre-compile the fixed gear ratio dict
+FIXED_GEAR_RATIOS_DICT = {i+1: ratio for i, ratio in enumerate(FIXED_GEAR_RATIOS_LIST)}
+
+def _vehicle_dynamics_model(t, y, final_drive_ratio):
+    """
+    This is the core ODE function.
+    t = current time
+    y = state vector [speed_mps, total_fuel_grams, distance_meters]
+    """
+    # Unpack state vector
+    speed_mps = max(0, y[0])
+    distance_meters = y[2]
+    
+    # Get current route conditions from interpolators
+    current_slope = route_slope_interpolator(distance_meters)
+    target_speed_mps = route_speed_limit_interpolator(distance_meters)
+    
+    # --- NEW DRIVER MODEL (3-State Logic) ---
+    engine_torque_req = 0.0
+    fuel_flow_gps = 0.0
+    best_gear_ratio = FIXED_GEAR_RATIOS_LIST[0] # Default
+    
+    # Calculate resistance force *once*
+    f_resistance = calculate_resistance_forces(speed_mps, current_slope)
+
+    if speed_mps < (target_speed_mps - 0.5):
+        # --- 1. ACCELERATING ---
+        # "80% max torque" logic
+        best_power_gear_ratio = FIXED_GEAR_RATIOS_LIST[0]
+        max_possible_wheel_torque = -float('inf')
+        
+        for gear, ratio in FIXED_GEAR_RATIOS_DICT.items():
+            rpm = get_engine_rpm_from_speed(speed_mps, ratio, final_drive_ratio)
+            if rpm > MAX_ENGINE_RPM: continue
+            
+            engine_tq_max = get_max_torque(rpm)
+            wheel_tq = (engine_tq_max * ratio * final_drive_ratio) / TIRE_RADIUS_M
+            
+            if wheel_tq > max_possible_wheel_torque:
+                max_possible_wheel_torque = wheel_tq
+                best_power_gear_ratio = ratio
+        
+        # Now use the best power gear
+        rpm_at_max_power = get_engine_rpm_from_speed(speed_mps, best_power_gear_ratio, final_drive_ratio)
+        engine_torque_req = get_max_torque(rpm_at_max_power) * 0.80
+        fuel_flow_gps = get_fuel_flow(rpm_at_max_power, engine_torque_req)
+        best_gear_ratio = best_power_gear_ratio
+
+    elif speed_mps > (target_speed_mps + 0.5):
+        # --- 2. DECELERATING ---
+        # "No fuel is used" (DFCO) logic
+        engine_torque_req = -10.0 # Engine braking
+        fuel_flow_gps = 0.0
+        # Use highest gear to minimize engine braking (smoother)
+        best_gear_ratio = FIXED_GEAR_RATIOS_LIST[-1] 
+    
+    else:
+        # --- 3. CRUISING ---
+        # "Optimal gear for torque" (eco-cruise) logic
+        # Find the engine torque needed to match resistance
+        wheel_torque_req = f_resistance * TIRE_RADIUS_M
+        
+        best_fuel_flow = float('inf')
+        best_cruise_gear_ratio = FIXED_GEAR_RATIOS_LIST[-1]
+        best_cruise_torque = 0.0
+        
+        for gear, ratio in FIXED_GEAR_RATIOS_DICT.items():
+            rpm = get_engine_rpm_from_speed(speed_mps, ratio, final_drive_ratio)
+            if rpm < MIN_ENGINE_RPM or rpm > MAX_ENGINE_RPM: continue
+            
+            # Find engine torque required in this gear
+            engine_tq_req_cruise = (wheel_torque_req * TIRE_RADIUS_M) / (ratio * final_drive_ratio)
+            
+            # Check if engine can produce this torque
+            if engine_tq_req_cruise < get_min_torque(rpm) or engine_tq_req_cruise > get_max_torque(rpm):
+                continue
+            
+            current_fuel_flow = get_fuel_flow(rpm, engine_tq_req_cruise)
+            
+            if current_fuel_flow < best_fuel_flow:
+                best_fuel_flow = current_fuel_flow
+                best_cruise_gear_ratio = ratio
+                best_cruise_torque = engine_tq_req_cruise
+                
+        engine_torque_req = best_cruise_torque
+        fuel_flow_gps = best_fuel_flow
+        best_gear_ratio = best_cruise_gear_ratio
+
+    # --- FINAL PHYSICS CALCULATION ---
+    f_tractive = (engine_torque_req * best_gear_ratio * final_drive_ratio) / TIRE_RADIUS_M
+    f_net = f_tractive - f_resistance
+    acceleration_mps2 = f_net / VEHICLE_MASS_KG
+    
+    # Return derivatives
+    return [acceleration_mps2, fuel_flow_gps, speed_mps]
+
+def run_drive_cycle_simulation(final_drive_ratio):
+    """
+    Runs the full ODE simulation for a given final drive ratio.
+    Returns the total fuel consumed in Liters.
+    """
+    t_start = 0.0
+    t_end = total_route_distance_m / (50 / 3.6) * 1.5 # Estimate end time
+    initial_state = [0.0, 0.0, 0.0] # [speed_mps, fuel_grams, distance_m]
+    
+    # We need to stop the simulation when we reach the end of the route
+    def stop_at_end(t, y, final_drive_ratio):
+        return y[2] - total_route_distance_m
+    stop_at_end.terminal = True # This tells solve_ivp to stop
+    stop_at_end.direction = 1  # Stop when distance crosses zero (goes positive)
+
+    sol = solve_ivp(
+        _vehicle_dynamics_model,
+        [t_start, t_end],
+        initial_state,
+        method='RK23',
+        events=stop_at_end, # Stop when we hit the end
+        args=(final_drive_ratio,)
+    )
+    
+    total_fuel_grams = sol.y[1][-1]
+    total_fuel_liters = total_fuel_grams / FUEL_DENSITY_GPL
+    
+    return total_fuel_liters
+
+# --- 6. OPTIMIZATION PROBLEM SETUP ---
+
+def objective_function(final_drive_ratio):
+    """
+    The "Worker" function that minimize_scalar will call.
+    It takes ONE argument (the final drive) and returns ONE cost (fuel).
+    """
+    start_time = time.time()
+    
+    fuel_liters = run_drive_cycle_simulation(final_drive_ratio)
+            
+    cost = fuel_liters
+    end_time = time.time()
+    
+    print(f"  Testing FD: {final_drive_ratio:.3f} | Cost (Fuel): {cost:.5f} L | Time: {end_time - start_time:.2f}s")
+    
+    return cost
+
+# --- 7. MAIN EXECUTION ---
+
+if __name__ == "__main__":
+    try:
+        # 1. Setup engine model (Interpolation)
+        setup_engine_model()
+        
+        # 2. Setup route model (Interpolation)
+        preprocess_route()
+        
+        print("\n--- Final Drive Ratio Optimization ---")
+        
+        # 3. Run baseline test
+        print("\nCalculating baseline fuel economy with initial ratio:")
+        baseline_fuel = objective_function(BASE_FINAL_DRIVE_RATIO)
+        print(f"Baseline Fuel Consumption: {baseline_fuel:.5f} Liters")
+        
+        print("\n--- STARTING 1D OPTIMIZATION ---")
+        
+        # 4. Run the Optimizer!
+        # minimize_scalar is for 1D problems. It's much faster.
+        result = minimize_scalar(
+            objective_function,
+            bounds=(3.0, 4.5), # Search between these final drive ratios
+            method='bounded'
+        )
+        
+        print("\n--- OPTIMIZATION COMPLETE ---")
+        
+        if result.success:
+            optimal_ratio = result.x
+            final_fuel_cost = result.fun
+            
+            print(f"Baseline Ratio: {BASE_FINAL_DRIVE_RATIO:.3f}")
+            print(f"Baseline Fuel:  {baseline_fuel:.5f} Liters")
+            
+            print(f"\nOptimal Ratio:  {optimal_ratio:.3f}")
+            print(f"Optimal Fuel:   {final_fuel_cost:.5f} Liters")
+            
+            fuel_saved = baseline_fuel - final_fuel_cost
+            percent_saved = (fuel_saved / baseline_fuel) * 100
+            print(f"\nFuel Saved: {fuel_saved:.5f} L ({percent_saved:.2f}% improvement)")
+        else:
+            print("Optimization did not converge.")
+
+    except ImportError:
+        print("\n--- ERROR ---")
+        print("This script requires 'numpy', 'matplotlib', and 'scipy'.")
+        print("pip install numpy matplotlib scipy")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
