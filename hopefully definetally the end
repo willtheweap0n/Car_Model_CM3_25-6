@@ -100,6 +100,17 @@ def setup_engine_model():
     print("Engine model setup complete.")
 
 # --- 3. CORE PHYSICS FUNCTIONS ---
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate great-circle distance between two points in meters"""
+    R = 6371000  # Earth radius in meters
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    delta_phi = np.radians(lat2 - lat1)
+    delta_lambda = np.radians(lon2 - lon1)
+    a = np.sin(delta_phi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(delta_lambda/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return R * c
+    
 def get_engine_rpm_from_speed(speed_mps, gear_ratio, final_drive):
     if TIRE_RADIUS_M == 0: return 0
     wheel_rpm = (speed_mps / (2 * math.pi * TIRE_RADIUS_M)) * 60
@@ -618,8 +629,9 @@ def create_route_file():
 
 def _root_find_function(speed_mps, gear, slope_percent, final_drive_ratio, get_max_torque_at_rpm):
     """
+    This is our f(x).
     Calculates the Net Force on the vehicle.
-    `fsolve` will try to find the `speed_mps` that makes this return 0.
+    We want to find the `speed_mps` that makes this return 0.
     """
     if speed_mps < 0:
         return 1e9 # Disallow negative speeds
@@ -637,20 +649,59 @@ def _root_find_function(speed_mps, gear, slope_percent, final_drive_ratio, get_m
     f_net = f_tractive - f_resistance
     return f_net
 
+def _root_find_derivative_numeric(f, speed_mps, args, h=0.01):
+    """
+    This is our f'(x).
+    Calculates the derivative of f(x) numerically using the central difference formula.
+    f'(x) ≈ ( f(x+h) - f(x-h) ) / 2h
+    """
+    f_plus_h = f(speed_mps + h, *args)
+    f_minus_h = f(speed_mps - h, *args)
+    
+    # Handle division by zero
+    if (2 * h) == 0:
+        return 0.0
+        
+    return (f_plus_h - f_minus_h) / (2 * h)
+
+def newton_raphson_solver(f, f_prime, x0, args=(), tol=0.01, max_iter=50):
+    """
+    Our manual implementation of the Newton-Raphson algorithm.
+    """
+    x_n = x0
+    for i in range(max_iter):
+        f_x = f(x_n, *args)
+        if abs(f_x) < tol:
+            return x_n # Success!
+        f_prime_x = f_prime(f, x_n, args=args)
+        if f_prime_x == 0:
+            print(f"  Newton-Raphson failed: derivative is zero.")
+            return None
+        x_n = x_n - (f_x / f_prime_x)
+    print(f"  Newton-Raphson failed to converge after {max_iter} iterations.")
+    return None
+
 def find_top_speed(final_drive_ratio, gear, slope_percent, get_max_torque_func):
     """
-    Wrapper for the fsolve root finder.
+    Wrapper for our new Newton-Raphson root finder.
     """
     initial_guess_kmh = 200.0
     initial_guess_mps = initial_guess_kmh / 3.6
+    args_tuple = (gear, slope_percent, final_drive_ratio, get_max_torque_func)
     
     try:
-        top_speed_mps = fsolve(
+        top_speed_mps = newton_raphson_solver(
             _root_find_function,
+            _root_find_derivative_numeric,
             initial_guess_mps,
-            args=(gear, slope_percent, final_drive_ratio, get_max_torque_func)
-        )[0]
-        return top_speed_mps * 3.6 # Return km/h
+            args=args_tuple
+        )
+        
+        if top_speed_mps is not None:
+            return top_speed_mps * 3.6 # Return km/h
+        else:
+            return 0.0 # Solver failed
+            
     except Exception as e:
         print(f"  Error in root finding: {e}")
         return 0.0
@@ -687,7 +738,7 @@ if __name__ == "__main__":
             
             result = minimize_scalar(
                 objective_function,
-                bounds=(2.0, 4.5), # Search between these final drive ratios
+                bounds=(3.0, 4.5), # Search between these final drive ratios
                 method='bounded',
                 options={'xatol': 0.01} # Find answer within 0.01 ratio
             )
@@ -707,7 +758,7 @@ if __name__ == "__main__":
                 optimal_ratio = BASE_FINAL_DRIVE_RATIO # Use baseline as fallback
 
         # --- TASK 5: RUN TOP SPEED ANALYSIS (ROOT FINDING) ---
-        print("\n--- TASK 5: RUNNING TOP SPEED ANALYSIS (ROOT FINDING) ---")
+        print("\n--- TASK 5: RUNNING TOP SPEED ANALYSIS (NEWTON-RAPHSON) ---")
         
         print(f"\nTesting BASELINE Final Drive: {BASE_FINAL_DRIVE_RATIO:.3f}")
         top_speed_base = find_top_speed(BASE_FINAL_DRIVE_RATIO, 6, 0.0, get_max_torque)
