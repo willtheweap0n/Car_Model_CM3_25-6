@@ -483,20 +483,125 @@ def get_route_from_api(start_coords, end_coords):
             print(f"❌ OSRM API error {response.status_code}: {response.text}"); return None, None
     except Exception as e:
         print(f"❌ API call failed: {e}"); return None, None
+        
+def get_user_coordinates():
+    """
+    Get start and end coordinates from user with better validation
+    """
+    print("📍 Enter route coordinates (latitude, longitude):")
+    print("   Format: latitude,longitude")
+    print("   Example: 51.5074,-0.1278 (London)")
+    print("   Example: 55.9533,-3.1883 (Edinburgh)")
+    print("   Example: 40.7128,-74.0060 (New York)")
+    print()
 
+    cities = {
+        "1": ("London", (51.5074, -0.1278)),
+        "2": ("Edinburgh", (55.9533, -3.1883)),
+        "3": ("Manchester", (53.4808, -2.2426)),
+        "4": ("New York", (40.7128, -74.0060)),
+        "5": ("Los Angeles", (34.0522, -118.2437)),
+        "6": ("Chicago", (41.8781, -87.6298)),
+        "7": ("Custom", None)
+    }
+
+    print("Choose start city or enter custom coordinates:")
+    for key, (name, coords) in cities.items():
+        if coords:
+            print(f"   {key}. {name}: {coords[0]:.4f}, {coords[1]:.4f}")
+        else:
+            print(f"   {key}. Custom coordinates")
+    start_choice = input("\nSelect start (1-7): ").strip()
+
+    if start_choice in cities and start_choice != "7":
+        start_coords = cities[start_choice][1]
+        print(f"   Start: {cities[start_choice][0]} {start_coords}")
+    else:
+        start_input = input("Enter START coordinates (lat,lon): ").strip()
+        start_coords = parse_coordinates(start_input)
+        if start_coords is None:
+            return None, None
+
+    print("\nChoose end city or enter custom coordinates:")
+    for key, (name, coords) in cities.items():
+        if coords:
+            print(f"   {key}. {name}: {coords[0]:.4f}, {coords[1]:.4f}")
+        else:
+            print(f"   {key}. Custom coordinates")
+    end_choice = input("\nSelect end (1-7): ").strip()
+
+    if end_choice in cities and end_choice != "7":
+        end_coords = cities[end_choice][1]
+        print(f"   End: {cities[end_choice][0]} {end_coords}")
+    else:
+        end_input = input("Enter END coordinates (lat,lon): ").strip()
+        end_coords = parse_coordinates(end_input)
+        if end_coords is None:
+            return None, None
+
+    print(f"\n   Route: {start_coords} → {end_coords}")
+    return start_coords, end_coords
+
+def parse_coordinates(coord_input):
+    """
+    Parse coordinate input with validation
+    """
+    try:
+        if not coord_input:
+            print("   Using London as default")
+            return (51.5074, -0.1278)
+        parts = [part.strip() for part in coord_input.split(',')]
+        if len(parts) != 2:
+            print("❌ Please use format: latitude,longitude")
+            return None
+        lat = float(parts[0]); lon = float(parts[1])
+        if not (-90 <= lat <= 90):
+            print("❌ Latitude must be between -90 and 90")
+            return None
+        if not (-180 <= lon <= 180):
+            print("❌ Longitude must be between -180 and 180")
+            return None
+        return (lat, lon)
+    except ValueError:
+        print("❌ Please enter valid numbers for coordinates")
+        return None
+
+def create_fallback_route(start_coords, end_coords):
+    print("   Creating fallback route...")
+    num_points = 200
+    start_lat, start_lon = start_coords
+    end_lat, end_lon = end_coords
+    lats = np.linspace(start_lat, end_lat, num_points)
+    lons = np.linspace(start_lon, end_lon, num_points)
+    t = np.linspace(0, np.pi, num_points)
+    curve_strength = 0.1 * (end_lon - start_lon)
+    lons = lons + curve_strength * np.sin(t)
+    df_dense = pd.DataFrame({'lat': lats, 'lon': lons})
+    df_sparse = get_elevation_data(df_dense, num_points=50)
+    return df_dense, df_sparse
+    
 def create_route_file():
     """
-    Main function from route_mapper.py, hard-coded for Edi->Lon
+    Main function from route_mapper.py, now interactive.
     """
     print("=" * 50)
-    print("🚗 1. RUNNING ROUTE MAPPER")
+    print("🚗 1. RUNNING INTERACTIVE ROUTE MAPPER")
     print("=" * 50)
-    start_coords = (55.9533, -3.1883); end_coords = (51.5074, -0.1278)
-    print(f"\n📍 Hard-coded route: Edinburgh {start_coords} → London {end_coords}")
+    
+    start_coords, end_coords = get_user_coordinates()
+    if start_coords is None or end_coords is None:
+        return False
+
     print("\n1. Fetching route data from APIs...")
     df_dense, df_sparse = get_route_from_api(start_coords, end_coords)
+    
     if df_dense is None:
-        print("❌ Failed to get route data. Cannot proceed."); return False
+        print("❌ Failed to get route data. Using fallback sample route...")
+        df_dense, df_sparse = create_fallback_route(start_coords, end_coords)
+        if df_dense is None:
+            print("❌ Fallback route failed. Cannot proceed.")
+            return False
+
     print("2. Interpolating elevation data...")
     df_dense = interpolate_elevation(df_dense, df_sparse)
     print("3. Analyzing speed limits for each segment...")
@@ -559,7 +664,7 @@ if __name__ == "__main__":
         
         # --- TASK 2: CREATE ROUTE FILE ---
         print("\n--- TASK 2: CREATING ROUTE FILE ---")
-        if not create_route_file():
+        if not create_route_file(): # This now calls the INTERACTIVE mapper
             raise SystemExit("\n🛑 Halting execution. Route file could not be generated.")
 
         # --- TASK 3: PROCESS ROUTE FILE ---
