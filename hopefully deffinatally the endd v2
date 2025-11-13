@@ -28,6 +28,7 @@ DRAG_COEFFICIENT = 0.3
 ROLLING_RESISTANCE_COEFFICIENT = 0.015
 FIXED_GEAR_RATIOS_LIST = [3.70, 1.95, 1.30, 1.03, 0.84, 0.68]
 BASE_FINAL_DRIVE_RATIO = 3.85
+BASELINE_RATIO = 3.85
 TIRE_RADIUS_M = 0.323
 MIN_ENGINE_RPM = 800.0
 MAX_ENGINE_RPM = 6800.0
@@ -37,6 +38,42 @@ ROUTE_FILENAME = "final_route_data.csv"
 API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImJmMWQ0ZjgyNmNhZTRjZjA5M2I5ODAzMDkyZTY1MTJjIiwiaCI6Im11cm11cjY0In0="
 START_COORDS = (55.9533, -3.1883) # Edinburgh (lat, lon)
 END_COORDS   = (55.8642, -4.2518)   # Glasgow (lat, lon)
+OUTPUT_FILENAME = "final_route_data.csv"
+# --- 2. HELPER FUNCTIONS ---
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate great-circle distance between two points in meters
+    """
+    R = 6371000  # Earth radius in meters
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    delta_phi = np.radians(lat2 - lat1)
+    delta_lambda = np.radians(lon2 - lon1)
+    a = np.sin(delta_phi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(delta_lambda/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return R * c
+
+def calculate_point_distances(df_route):
+    """
+    Calculate distances between consecutive points
+    """
+    print("   - Calculating point-to-point distances...")
+    distances = np.zeros(len(df_route))
+    lats = df_route['lat'].values
+    lons = df_route['lon'].values
+    
+    for i in range(len(df_route)-1):
+        distances[i] = haversine_distance(lats[i], lons[i], lats[i+1], lons[i+1])
+
+    df_route['distance_to_next_m'] = distances
+    return df_route
+
+def kmh_to_mph(kmh):
+    return round(kmh * 0.621371, 1)
+
+def mph_to_kmh(mph):
+    return round(mph * 1.60934, 1)
 
 # --- 2. CORE ENGINE MODEL (INTERPOLATION) ---
 (get_fuel_flow, get_max_torque, get_min_torque) = (None, None, None)
@@ -579,7 +616,40 @@ def find_top_speed(final_drive_ratio, gear, slope_percent, get_max_torque_func):
         print(f"  Error in root finding: {e}")
         return 0.0
 
+# --- 6. PROBLEM 2: FIND MAX SLOPE (GRADEABILITY) ---
 
+def _find_max_slope_f(slope_percent, speed_mps, gear, final_drive_ratio, get_max_torque_at_rpm):
+    """ This is the f(x) for the Max Slope problem. We solve for slope. """
+    
+    # Calculate Tractive Force at WOT (this is now a constant)
+    gear_ratio = FIXED_GEAR_RATIOS_DICT[gear]
+    current_rpm = get_engine_rpm_from_speed(speed_mps, gear_ratio, final_drive_ratio)
+    max_engine_torque = get_max_torque_at_rpm(current_rpm)
+    total_reduction = gear_ratio * final_drive_ratio
+    f_tractive = (max_engine_torque * total_reduction) / TIRE_RADIUS_M
+    
+    # Calculate Resistance Force (this is now the variable)
+    f_resistance = calculate_resistance_forces(speed_mps, slope_percent)
+    
+    return f_tractive - f_resistance
+
+def find_max_slope(final_drive_ratio, gear, speed_kmh):
+    """ Wrapper for the Newton-Raphson solver for max slope. """
+    initial_guess_slope = 5.0 # Guess 5% grade
+    speed_mps = speed_kmh / 3.6
+    args_tuple = (speed_mps, gear, final_drive_ratio, get_max_torque)
+    
+    max_slope_pct = newton_raphson_solver(
+        _find_max_slope_f,
+        _root_find_derivative_numeric,
+        initial_guess_slope,
+        args=args_tuple
+    )
+    
+    if max_slope_pct is not None:
+        return max_slope_pct
+    else:
+        return 0.0 # Solver failed
 # --- 11. MAIN EXECUTION ---
 if __name__ == "__main__":
     try:
