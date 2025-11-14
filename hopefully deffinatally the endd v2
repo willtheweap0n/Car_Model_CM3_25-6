@@ -11,9 +11,7 @@ import os # Import os to check if file exists
 # --- Imports from route_mapper.py ---
 from scipy.spatial import cKDTree
 import requests
-import osmnx as ox
-import geopandas as gpd
-from shapely.geometry import Point
+# Note: osmnx, geopandas, shapely are NOT needed for this manual version
 import re
 import json
 # --- End of imports ---
@@ -30,12 +28,52 @@ DRAG_COEFFICIENT = 0.3
 ROLLING_RESISTANCE_COEFFICIENT = 0.015
 FIXED_GEAR_RATIOS_LIST = [3.70, 1.95, 1.30, 1.03, 0.84, 0.68]
 BASE_FINAL_DRIVE_RATIO = 3.85
+BASELINE_RATIO = 3.85
 TIRE_RADIUS_M = 0.323
 MIN_ENGINE_RPM = 800.0
 MAX_ENGINE_RPM = 6800.0
 FIXED_GEAR_RATIOS_DICT = {i+1: ratio for i, ratio in enumerate(FIXED_GEAR_RATIOS_LIST)}
 MPH_TO_MPS = 0.44704 # Conversion constant for miles per hour to m/s
-ROUTE_FILENAME = "final_route_highres_elevation_speed_mph.csv"
+ROUTE_FILENAME = "final_route_data.csv"
+API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImJmMWQ0ZjgyNmNhZTRjZjA5M2I5ODAzMDkyZTY1MTJjIiwiaCI6Im11cm11cjY0In0="
+START_COORDS = (55.9533, -3.1883) # Edinburgh (lat, lon)
+END_COORDS   = (55.8642, -4.2518)   # Glasgow (lat, lon)
+OUTPUT_FILENAME = "final_route_data.csv"
+# --- 2. HELPER FUNCTIONS ---
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate great-circle distance between two points in meters
+    """
+    R = 6371000  # Earth radius in meters
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    delta_phi = np.radians(lat2 - lat1)
+    delta_lambda = np.radians(lon2 - lon1)
+    a = np.sin(delta_phi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(delta_lambda/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return R * c
+
+def calculate_point_distances(df_route):
+    """
+    Calculate distances between consecutive points
+    """
+    print("   - Calculating point-to-point distances...")
+    distances = np.zeros(len(df_route))
+    lats = df_route['lat'].values
+    lons = df_route['lon'].values
+    
+    for i in range(len(df_route)-1):
+        distances[i] = haversine_distance(lats[i], lons[i], lats[i+1], lons[i+1])
+
+    df_route['distance_to_next_m'] = distances
+    return df_route
+
+def kmh_to_mph(kmh):
+    return round(kmh * 0.621371, 1)
+
+def mph_to_kmh(mph):
+    return round(mph * 1.60934, 1)
 
 # --- 2. CORE ENGINE MODEL (INTERPOLATION) ---
 (get_fuel_flow, get_max_torque, get_min_torque) = (None, None, None)
@@ -78,7 +116,6 @@ def setup_engine_model():
         [0.50,0.97,1.50,1.64,1.74,1.84,2.18,2.51,2.85,3.20,3.85,4.47,5.28,5.97,6.64,7.74,8.81,9.11],
         [0.54,1.08,1.68,1.84,1.95,2.07,2.46,2.84,3.21,3.60,4.32,5.10,5.94,6.70,7.42,8.48,9.51,9.80]
     ])
-    
     rads_to_rpm = 60 / (2 * np.pi)
     wot_speed_rads=np.array([0.0,95.0,157.2,178.0,209.5,235.7,256.4,282.7,314.1,356.1,429.4,628.3,680.7])
     wot_torque_nm=np.array([0.0,134.6,164.9,167.8,187.9,188.3,182.3,188.2,201.4,197.4,200.1,184.0,0.0])
@@ -87,31 +124,20 @@ def setup_engine_model():
     _get_fuel_flow = RectBivariateSpline(torque_nm_axis, speed_rads_axis, fuel_gps_map, kx=1, ky=1)
     _get_max_torque = interp1d(wot_speed_rads * rads_to_rpm, wot_torque_nm, kind='linear', bounds_error=False, fill_value=0.0)
     _get_min_torque = interp1d(ct_speed_rads * rads_to_rpm, ct_torque_nm, kind='linear', bounds_error=False, fill_value=-16.0)
-    
     def get_fuel_flow_gps(rpm, torque):
         rads = rpm * (2 * np.pi / 60)
         torque_clipped = np.clip(torque, torque_nm_axis[0], torque_nm_axis[-1])
         rads_clipped = np.clip(rads, speed_rads_axis[0], speed_rads_axis[-1])
         return _get_fuel_flow(torque_clipped, rads_clipped)[0][0]
-        
     get_fuel_flow = get_fuel_flow_gps
     get_max_torque = _get_max_torque
     get_min_torque = _get_min_torque
     print("Engine model setup complete.")
 
 # --- 3. CORE PHYSICS FUNCTIONS ---
-def haversine_distance(lat1, lon1, lat2, lon2):
-    """Calculate great-circle distance between two points in meters"""
-    R = 6371000  # Earth radius in meters
-    phi1 = np.radians(lat1)
-    phi2 = np.radians(lat2)
-    delta_phi = np.radians(lat2 - lat1)
-    delta_lambda = np.radians(lon2 - lon1)
-    a = np.sin(delta_phi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(delta_lambda/2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
-    return R * c
-    
 def get_engine_rpm_from_speed(speed_mps, gear_ratio, final_drive):
+    # This function is used by BOTH the hybrid sim and the root finder
+    # It must accept a float `gear_ratio`
     if TIRE_RADIUS_M == 0: return 0
     wheel_rpm = (speed_mps / (2 * math.pi * TIRE_RADIUS_M)) * 60
     engine_rpm = wheel_rpm * gear_ratio * final_drive
@@ -141,7 +167,7 @@ def preprocess_route():
         df_route = pd.read_csv(ROUTE_FILENAME)
     except FileNotFoundError:
         print(f"❌ ERROR: Route file not found: '{ROUTE_FILENAME}'")
-        print("Please run 'route_mapper.py' (part of this script) first to generate the route.")
+        print("Please run this script's `create_route_file()` function first.")
         return False
     except Exception as e:
         print(f"❌ ERROR: Could not read route file: {e}")
@@ -336,294 +362,178 @@ def objective_function(final_drive_ratio):
     print(f"  FD: {final_drive_ratio:.3f} | Cost: {cost:.5f} L | Time: {end_time - start_time:.2f}s")
     return cost
 
-# --- 8. ROUTE MAPPER FUNCTIONS (from route_mapper.py) ---
-# All functions from your script are now part of this file
+# --- 8. ROUTE MAPPER FUNCTIONS (from route_mapper_manual.py) ---
 
-def get_elevation_data(df_route, num_points=50):
-    print("⛰️  Generating elevation data...")
-    if len(df_route) > num_points:
-        indices = np.linspace(0, len(df_route)-1, num_points, dtype=int)
-        df_sparse = df_route.iloc[indices].copy()
-    else:
-        df_sparse = df_route.copy()
-    elevation = generate_realistic_elevation(len(df_sparse))
-    df_sparse['elev_m'] = elevation
-    return df_sparse
-
-def generate_realistic_elevation(num_points):
-    x = np.linspace(0, 4*np.pi, num_points)
-    elevation = 50 + 80 * np.sin(x) + 30 * np.sin(2*x + 1) + np.random.normal(0, 8, num_points)
-    elevation = np.maximum(elevation, 10)
-    return np.round(elevation, 1)
-
-def interpolate_elevation(df_dense, df_sparse):
-    print("   - Interpolating elevation...")
-    tree = cKDTree(df_sparse[["lon", "lat"]].values)
-    distances, indices = tree.query(df_dense[["lon", "lat"]].values, k=1)
-    df_dense["elev_m"] = df_sparse.iloc[indices]["elev_m"].values
-    df_dense["elev_m"] = df_dense["elev_m"].rolling(window=5, center=True, min_periods=1).mean()
-    return df_dense
-
-def calculate_point_distances(df_route):
-    print("   - Calculating point distances...")
-    distances = np.zeros(len(df_route))
-    # Use the haversine_distance from Section 3
-    for i in range(len(df_route)-1):
-        lat1, lon1 = df_route.iloc[i][['lat', 'lon']]
-        lat2, lon2 = df_route.iloc[i+1][['lat', 'lon']]
-        distances[i] = haversine_distance(lat1, lon1, lat2, lon2)
-    df_route['distance_to_next_m'] = distances
-    return df_route
-
-def segment_route(df_route):
-    print("   - Segmenting route...")
-    df_route['segment_id'] = 0
-    df_route['segment_type'] = 'unknown'
-    current_segment = 0; segment_start = 0; min_segment_length = 5
-    for i in range(1, len(df_route)):
-        segment_length = i - segment_start; new_segment = False
-        if segment_length >= min_segment_length:
-            recent_distances = df_route.iloc[max(segment_start, i-5):i]['distance_to_next_m']
-            if len(recent_distances) > 1 and np.std(recent_distances) > 50: new_segment = True
-            recent_elevations = df_route.iloc[max(segment_start, i-5):i]['elev_m']
-            if len(recent_elevations) > 1 and abs(recent_elevations.iloc[-1] - recent_elevations.iloc[0]) > 15: new_segment = True
-            if segment_length >= 30: new_segment = True
-        if new_segment:
-            segment_points = df_route.iloc[segment_start:i]
-            segment_type = classify_segment(segment_points)
-            df_route.loc[segment_start:i, 'segment_id'] = current_segment
-            df_route.loc[segment_start:i, 'segment_type'] = segment_type
-            current_segment += 1; segment_start = i
-    if segment_start < len(df_route):
-        segment_points = df_route.iloc[segment_start:]
-        segment_type = classify_segment(segment_points)
-        df_route.loc[segment_start:, 'segment_id'] = current_segment
-        df_route.loc[segment_start:, 'segment_type'] = segment_type
-    print(f"   - Created {current_segment + 1} segments")
-    return df_route
-
-def classify_segment(segment_df):
-    if len(segment_df) < 2: return 'unknown'
-    avg_distance = segment_df['distance_to_next_m'].mean()
-    total_distance = segment_df['distance_to_next_m'].sum()
-    elev_std = segment_df['elev_m'].std()
-    if avg_distance > 80 and total_distance > 800: return 'highway'
-    elif avg_distance > 50: return 'primary'
-    elif elev_std > 12: return 'hilly'
-    elif total_distance < 300: return 'urban'
-    else: return 'secondary'
-
-def assign_speed_limits_mpH(df_route):
-    print("   - Assigning speed limits (MPH)...")
-    speed_limits_mpH = {'highway': 70, 'primary': 50, 'secondary': 40, 'hilly': 30, 'urban': 20, 'unknown': 30}
-    df_route['speed_limit_mph'] = df_route['segment_type'].map(speed_limits_mpH)
-    return df_route
-
-def enhance_with_osm_speeds_mpH(df_route):
-    print("   - Enhancing with OpenStreetMap data (this may take a moment)...")
-    try:
-        geometry = [Point(lon, lat) for lon, lat in zip(df_route['lon'], df_route['lat'])]
-        gdf_route = gpd.GeoDataFrame(df_route, geometry=geometry, crs='EPSG:4326')
-        bounds = gdf_route.total_bounds; buffer_degree = 0.02
-        north, south, east, west = (bounds[3] + buffer_degree, bounds[1] - buffer_degree, bounds[2] + buffer_degree, bounds[0] - buffer_degree)
-        G = ox.graph_from_bbox(north, south, east, west, network_type='drive')
-        gdf_roads = ox.graph_to_gdfs(G, nodes=False); gdf_roads = gdf_roads.to_crs(gdf_route.crs)
-        gdf_joined = gpd.sjoin_nearest(gdf_route, gdf_roads[['maxspeed', 'highway', 'geometry']], how='left', distance_col='distance_to_road')
-        def parse_osm_speed_to_mph(speed_str):
-            if pd.isna(speed_str): return None
-            if isinstance(speed_str, (int, float)): return kmh_to_mph(float(speed_str))
-            speed_str = str(speed_str).lower()
-            if 'mph' in speed_str:
-                numbers = re.findall(r'\d+', speed_str)
-                if numbers: return float(numbers[0])
-            elif any(x in speed_str for x in ['kmh', 'km/h']):
-                numbers = re.findall(r'\d+', speed_str)
-                if numbers: return kmh_to_mph(float(numbers[0]))
-            elif speed_str.isdigit():
-                return kmh_to_mph(float(speed_str))
-            return None
-        gdf_joined['osm_speed_limit_mph'] = gdf_joined['maxspeed'].apply(parse_osm_speed_to_mph)
-        valid_osm_mask = gdf_joined['osm_speed_limit_mph'].notna()
-        df_route.loc[valid_osm_mask, 'speed_limit_mph'] = gdf_joined.loc[valid_osm_mask, 'osm_speed_limit_mph']
-        print(f"   - Updated {valid_osm_mask.sum()} points with OSM speed limits")
-    except Exception as e:
-        print(f"   - OSM enhancement skipped: {e}")
-    return df_route
-
-def kmh_to_mph(kmh): return round(kmh * 0.621371, 1)
-def mph_to_kmh(mph): return round(mph * 1.60934, 1)
-
-def print_enhanced_route_summary(df_route):
-    print("\n" + "="*60); print("📊 ENHANCED ROUTE SUMMARY (MPH)"); print("="*60)
-    total_points = len(df_route); total_distance_m = df_route['distance_to_next_m'].sum()
-    total_distance_miles = total_distance_m / 1609.34
-    print(f"Total Points: {total_points}")
-    print(f"Total Distance: {total_distance_m/1000:.2f} km ({total_distance_miles:.2f} miles)")
-    print(f"Elevation Range: {df_route['elev_m'].min():.1f} - {df_route['elev_m'].max():.1f} m")
-    segment_summary = df_route.groupby(['segment_id', 'segment_type']).agg({'lat': 'count', 'distance_to_next_m': 'sum', 'speed_limit_mph': 'first', 'elev_m': ['min', 'max', 'mean']}).round(1)
-    segment_summary.columns = ['points', 'length_m', 'speed_mph', 'elev_min', 'elev_max', 'elev_mean']
-    segment_summary['length_miles'] = (segment_summary['length_m'] / 1609.34).round(3)
-    print(f"\nSegments: {len(segment_summary)}")
-    print("\nSegment Details (Sample):")
-    print(segment_summary.head().to_string())
-    speed_stats = df_route['speed_limit_mph'].value_counts().sort_index()
-    print(f"\nSpeed Limit Distribution (MPH):")
-    for speed, count in speed_stats.items():
-        print(f"  {speed} mph: {count} points")
-    segment_summary.to_csv("route_segments_detailed_mph.csv")
-    print(f"\n💾 Detailed segment analysis saved to: route_segments_detailed_mph.csv")
-
-def get_route_from_api(start_coords, end_coords):
-    print(f"🗺️  Getting route from {start_coords} to {end_coords}...")
-    coordinates = f"{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}"
-    osrm_url = f"http://router.project-osrm.org/route/v1/driving/{coordinates}?overview=full&geometries=geojson"
-    print(f"   API URL: {osrm_url}")
-    try:
-        response = requests.get(osrm_url, timeout=30)
-        if response.status_code == 200:
-            data = response.json();
-            if 'routes' not in data or len(data['routes']) == 0:
-                print("❌ No route found."); return None, None
-            route_coords = data['routes'][0]['geometry']['coordinates']
-            print(f"   ✅ Route found: {len(route_coords)} points")
-            route_data = [{'lon': coord[0], 'lat': coord[1]} for coord in route_coords]
-            df_dense = pd.DataFrame(route_data)
-            df_sparse = get_elevation_data(df_dense, num_points=200) # Use more points for a long route
-            return df_dense, df_sparse
-        else:
-            print(f"❌ OSRM API error {response.status_code}: {response.text}"); return None, None
-    except Exception as e:
-        print(f"❌ API call failed: {e}"); return None, None
-        
-def get_user_coordinates():
+def get_route_from_ors(start_coords, end_coords, api_key):
     """
-    Get start and end coordinates from user with better validation
+    Get route data from OpenRouteService (ORS) API.
+    This provides PATH and ELEVATION.
     """
-    print("📍 Enter route coordinates (latitude, longitude):")
-    print("   Format: latitude,longitude")
-    print("   Example: 51.5074,-0.1278 (London)")
-    print("   Example: 55.9533,-3.1883 (Edinburgh)")
-    print("   Example: 40.7128,-74.0060 (New York)")
-    print()
+    print(f"🗺️  Getting route from {start_coords} to {end_coords} via ORS...")
 
-    cities = {
-        "1": ("London", (51.5074, -0.1278)),
-        "2": ("Edinburgh", (55.9533, -3.1883)),
-        "3": ("Manchester", (53.4808, -2.2426)),
-        "4": ("New York", (40.7128, -74.0060)),
-        "5": ("Los Angeles", (34.0522, -118.2437)),
-        "6": ("Chicago", (41.8781, -87.6298)),
-        "7": ("Custom", None)
+    start_ors = [start_coords[1], start_coords[0]]
+    end_ors = [end_coords[1], end_coords[0]]
+
+    url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
+    headers = {
+        "Authorization": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/geo+json"
+    }
+    body = {
+        "coordinates": [start_ors, end_ors],
+        "preference": "fastest",
+        "elevation": True,          # Request elevation data
+        "instructions": False,
+        "geometry_simplify": "false" # Get high-resolution path
     }
 
-    print("Choose start city or enter custom coordinates:")
-    for key, (name, coords) in cities.items():
-        if coords:
-            print(f"   {key}. {name}: {coords[0]:.4f}, {coords[1]:.4f}")
-        else:
-            print(f"   {key}. Custom coordinates")
-    start_choice = input("\nSelect start (1-7): ").strip()
-
-    if start_choice in cities and start_choice != "7":
-        start_coords = cities[start_choice][1]
-        print(f"   Start: {cities[start_choice][0]} {start_coords}")
-    else:
-        start_input = input("Enter START coordinates (lat,lon): ").strip()
-        start_coords = parse_coordinates(start_input)
-        if start_coords is None:
-            return None, None
-
-    print("\nChoose end city or enter custom coordinates:")
-    for key, (name, coords) in cities.items():
-        if coords:
-            print(f"   {key}. {name}: {coords[0]:.4f}, {coords[1]:.4f}")
-        else:
-            print(f"   {key}. Custom coordinates")
-    end_choice = input("\nSelect end (1-7): ").strip()
-
-    if end_choice in cities and end_choice != "7":
-        end_coords = cities[end_choice][1]
-        print(f"   End: {cities[end_choice][0]} {end_coords}")
-    else:
-        end_input = input("Enter END coordinates (lat,lon): ").strip()
-        end_coords = parse_coordinates(end_input)
-        if end_coords is None:
-            return None, None
-
-    print(f"\n   Route: {start_coords} → {end_coords}")
-    return start_coords, end_coords
-
-def parse_coordinates(coord_input):
-    """
-    Parse coordinate input with validation
-    """
     try:
-        if not coord_input:
-            print("   Using London as default")
-            return (51.5074, -0.1278)
-        parts = [part.strip() for part in coord_input.split(',')]
-        if len(parts) != 2:
-            print("❌ Please use format: latitude,longitude")
+        response = requests.post(url, headers=headers, json=body, timeout=60)
+        print(f"   API Status: {response.status_code}")
+        
+        if response.status_code != 200:
+            print(f"❌ ORS API Error: {response.text}")
             return None
-        lat = float(parts[0]); lon = float(parts[1])
-        if not (-90 <= lat <= 90):
-            print("❌ Latitude must be between -90 and 90")
+
+        data = response.json()
+        if 'features' not in data or len(data['features']) == 0:
+            print("❌ No route found between these coordinates")
             return None
-        if not (-180 <= lon <= 180):
-            print("❌ Longitude must be between -180 and 180")
-            return None
-        return (lat, lon)
-    except ValueError:
-        print("❌ Please enter valid numbers for coordinates")
+
+        # --- Parse Geometry (Path & Elevation) ---
+        coords = data["features"][0]["geometry"]["coordinates"]
+        if len(coords[0]) == 3:
+            df = pd.DataFrame(coords, columns=["lon", "lat", "elev_m"])
+            print(f"   ✅ Route found: {len(df)} points with REAL elevation")
+        else:
+            df = pd.DataFrame(coords, columns=["lon", "lat"])
+            df["elev_m"] = 0.0 # Fallback
+            print(f"   ✅ Route found: {len(df)} points (no elevation data)")
+
+        return df
+
+    except Exception as e:
+        print(f"❌ ORS API call failed: {e}")
         return None
 
-def create_fallback_route(start_coords, end_coords):
-    print("   Creating fallback route...")
-    num_points = 200
-    start_lat, start_lon = start_coords
-    end_lat, end_lon = end_coords
-    lats = np.linspace(start_lat, end_lat, num_points)
-    lons = np.linspace(start_lon, end_lon, num_points)
-    t = np.linspace(0, np.pi, num_points)
-    curve_strength = 0.1 * (end_lon - start_lon)
-    lons = lons + curve_strength * np.sin(t)
-    df_dense = pd.DataFrame({'lat': lats, 'lon': lons})
-    df_sparse = get_elevation_data(df_dense, num_points=50)
-    return df_dense, df_sparse
+def apply_manual_speed_limits(df_route):
+    """
+    Applies the user-defined speed limit logic to the route.
+    """
+    print("   - Applying manual speed limit logic...")
     
+    # Calculate the cumulative distance in km for each point
+    df_route['cumulative_distance_km'] = df_route['distance_to_next_m'].cumsum() / 1000.0
+    
+    # Get the total route distance
+    total_route_distance_km = df_route['cumulative_distance_km'].iloc[-1]
+    
+    # --- Your Manual Speed Limit Logic ---
+    # We define the "break points" in km
+    k_10 = 10.0
+    k_12 = 12.0 # 10 + 2
+    k_13 = 13.0 # 12 + 1
+    k_14 = 14.0 # 13 + 1
+    
+    # Calculate end-of-route break points
+    end_minus_8k = total_route_distance_km - 8.0
+    end_minus_3k = total_route_distance_km - 3.0 # 5k after -8k
+    end_minus_2k = total_route_distance_km - 2.0 # 1k after -3k
+    
+    # We use np.select to apply these rules in order.
+    # The first condition a point matches is the one that is applied.
+    # We must put the *end of route* rules FIRST, as they are the most specific.
+    
+    conditions = [
+        (df_route['cumulative_distance_km'] > end_minus_2k),                  # Final 2k
+        (df_route['cumulative_distance_km'] > end_minus_3k),                  # 3k to 2k from end
+        (df_route['cumulative_distance_km'] > end_minus_8k),                  # 8k to 3k from end
+        (df_route['cumulative_distance_km'] <= k_10),                           # 0-10km
+        (df_route['cumulative_distance_km'] <= k_12),                           # 10-12km
+        (df_route['cumulative_distance_km'] <= k_13),                           # 12-13km
+        (df_route['cumulative_distance_km'] <= k_14),                           # 13-14km
+    ]
+    
+    choices = [
+        20.0, # Final 2k
+        30.0, # 3k-2k from end
+        40.0, # 8k-3k from end
+        20.0, # 0-10km
+        30.0, # 10-12km
+        40.0, # 12-13km
+        50.0  # 13-14km
+    ]
+    
+    # The 'default' is the 70 mph "highway" segment
+    df_route['speed_limit_mph'] = np.select(conditions, choices, default=70.0)
+    
+    print("   - Manual speed limits applied.")
+    return df_route
+
+def print_route_summary(df_route):
+    """
+    Print comprehensive summary of the route
+    """
+    print("\n" + "="*60)
+    print("📊 ROUTE SUMMARY")
+    print("="*60)
+    
+    total_points = len(df_route)
+    total_distance_m = df_route['distance_to_next_m'].sum()
+    total_distance_miles = total_distance_m / 1609.34
+    
+    print(f"Total Points: {total_points}")
+    print(f"Total Distance: {total_distance_m/1000:.2f} km ({total_distance_miles:.2f} miles)")
+    print(f"Elevation Range: {df_route['elev_m'].min():.1f}m to {df_route['elev_m'].max():.1f}m")
+    
+    # Speed limit distribution
+    speed_stats = df_route['speed_limit_mph'].value_counts().sort_index()
+    print(f"\nSpeed Limit Distribution (MPH):")
+    print("-" * 35)
+    for speed, count in speed_stats.items():
+        percentage = (count / total_points) * 100
+        kmh_equivalent = mph_to_kmh(speed)
+        print(f"  {speed} mph ({kmh_equivalent} km/h): {count} points ({percentage:.1f}%)")
+
+    avg_speed_limit_mph = df_route['speed_limit_mph'].mean()
+    avg_speed_limit_kmh = mph_to_kmh(avg_speed_limit_mph)
+    print(f"\nAverage Speed Limit: {avg_speed_limit_mph:.1f} mph ({avg_speed_limit_kmh:.1f} km/h)")
+
 def create_route_file():
     """
-    Main function from route_mapper.py, now interactive.
+    Main function from route_mapper.py, hard-coded for Edi->Gla
     """
     print("=" * 50)
-    print("🚗 1. RUNNING INTERACTIVE ROUTE MAPPER")
+    print("🚗 1. RUNNING ROUTE MAPPER")
     print("=" * 50)
     
-    start_coords, end_coords = get_user_coordinates()
-    if start_coords is None or end_coords is None:
+    print(f"\n📍 Hard-coded route: Edinburgh {START_COORDS} → Glasgow {END_COORDS}")
+    print("\n1. Fetching route data from ORS API...")
+    df_route = get_route_from_ors(START_COORDS, END_COORDS, API_KEY)
+
+    if df_route is not None:
+        print("\n2. Processing route data...")
+        df_processed = calculate_point_distances(df_route)
+        
+        # 3. Add *Manual* Speed Limits
+        df_processed = apply_manual_speed_limits(df_processed)
+        
+        # 4. Save Final CSV
+        df_processed.to_csv(OUTPUT_FILENAME, index=False)
+        print(f"\n✅ Successfully saved final route data to '{OUTPUT_FILENAME}'")
+        
+        # 5. Print Summary
+        print_route_summary(df_processed)
+        
+        # Show sample of the enhanced data
+        print(f"\n📋 Sample of final data (first 5 points):")
+        print(df_processed.head().to_string(index=False))
+        return True
+
+    else:
+        print("❌ Route generation failed. Exiting.")
         return False
-
-    print("\n1. Fetching route data from APIs...")
-    df_dense, df_sparse = get_route_from_api(start_coords, end_coords)
-    
-    if df_dense is None:
-        print("❌ Failed to get route data. Using fallback sample route...")
-        df_dense, df_sparse = create_fallback_route(start_coords, end_coords)
-        if df_dense is None:
-            print("❌ Fallback route failed. Cannot proceed.")
-            return False
-
-    print("2. Interpolating elevation data...")
-    df_dense = interpolate_elevation(df_dense, df_sparse)
-    print("3. Analyzing speed limits for each segment...")
-    df_dense = calculate_point_distances(df_dense) # Calculate distances *first*
-    df_dense = segment_route(df_dense)
-    df_dense = assign_speed_limits_mpH(df_dense)
-    df_dense = enhance_with_osm_speeds_mpH(df_dense)
-    df_dense.to_csv(ROUTE_FILENAME, index=False)
-    print_enhanced_route_summary(df_dense)
-    print(f"\n✅ Route mapping complete! File saved as '{ROUTE_FILENAME}'")
-    return True
 
 # --- 9. TOP SPEED FINDER (ROOT FINDING) ---
 
@@ -706,7 +616,41 @@ def find_top_speed(final_drive_ratio, gear, slope_percent, get_max_torque_func):
         print(f"  Error in root finding: {e}")
         return 0.0
 
-# --- 10. MAIN EXECUTION ---
+# --- 6. PROBLEM 2: FIND MAX SLOPE (GRADEABILITY) ---
+
+def _find_max_slope_f(slope_percent, speed_mps, gear, final_drive_ratio, get_max_torque_at_rpm):
+    """ This is the f(x) for the Max Slope problem. We solve for slope. """
+    
+    # Calculate Tractive Force at WOT (this is now a constant)
+    gear_ratio = FIXED_GEAR_RATIOS_DICT[gear]
+    current_rpm = get_engine_rpm_from_speed(speed_mps, gear_ratio, final_drive_ratio)
+    max_engine_torque = get_max_torque_at_rpm(current_rpm)
+    total_reduction = gear_ratio * final_drive_ratio
+    f_tractive = (max_engine_torque * total_reduction) / TIRE_RADIUS_M
+    
+    # Calculate Resistance Force (this is now the variable)
+    f_resistance = calculate_resistance_forces(speed_mps, slope_percent)
+    
+    return f_tractive - f_resistance
+
+def find_max_slope(final_drive_ratio, gear, speed_kmh):
+    """ Wrapper for the Newton-Raphson solver for max slope. """
+    initial_guess_slope = 5.0 # Guess 5% grade
+    speed_mps = speed_kmh / 3.6
+    args_tuple = (speed_mps, gear, final_drive_ratio, get_max_torque)
+    
+    max_slope_pct = newton_raphson_solver(
+        _find_max_slope_f,
+        _root_find_derivative_numeric,
+        initial_guess_slope,
+        args=args_tuple
+    )
+    
+    if max_slope_pct is not None:
+        return max_slope_pct
+    else:
+        return 0.0 # Solver failed
+# --- 11. MAIN EXECUTION ---
 if __name__ == "__main__":
     try:
         # --- TASK 1: SETUP ENGINE ---
@@ -715,7 +659,7 @@ if __name__ == "__main__":
         
         # --- TASK 2: CREATE ROUTE FILE ---
         print("\n--- TASK 2: CREATING ROUTE FILE ---")
-        if not create_route_file(): # This now calls the INTERACTIVE mapper
+        if not create_route_file(): # This now calls the MANUAL mapper
             raise SystemExit("\n🛑 Halting execution. Route file could not be generated.")
 
         # --- TASK 3: PROCESS ROUTE FILE ---
@@ -729,16 +673,17 @@ if __name__ == "__main__":
         print("\nCalculating baseline fuel economy with initial ratio:")
         baseline_fuel = objective_function(BASE_FINAL_DRIVE_RATIO)
         
+        optimal_ratio = BASE_FINAL_DRIVE_RATIO # Default to baseline
+        
         if baseline_fuel == float('inf'):
              print("ERROR: Baseline simulation failed. Cannot proceed.")
-             optimal_ratio = BASE_FINAL_DRIVE_RATIO # Use baseline as fallback
         else:
             print(f"Baseline Fuel Consumption: {baseline_fuel:.5f} Liters")
             print("\n--- STARTING 1D OPTIMIZATION ---")
             
             result = minimize_scalar(
                 objective_function,
-                bounds=(3.0, 4.5), # Search between these final drive ratios
+                bounds=(2.0, 4.5), # Search between these final drive ratios
                 method='bounded',
                 options={'xatol': 0.01} # Find answer within 0.01 ratio
             )
@@ -755,8 +700,7 @@ if __name__ == "__main__":
                 print(f"\nFuel Saved: {fuel_saved:.5f} L ({percent_saved:.2f}% improvement)")
             else:
                 print("Optimization did not converge.")
-                optimal_ratio = BASE_FINAL_DRIVE_RATIO # Use baseline as fallback
-
+       
         # --- TASK 5: RUN TOP SPEED ANALYSIS (ROOT FINDING) ---
         print("\n--- TASK 5: RUNNING TOP SPEED ANALYSIS (NEWTON-RAPHSON) ---")
         
@@ -768,12 +712,26 @@ if __name__ == "__main__":
         top_speed_opt = find_top_speed(optimal_ratio, 6, 0.0, get_max_torque)
         print(f"  > Top Speed (6th Gear, 0% Slope): {top_speed_opt:.1f} km/h")
 
-        print("\n--- ANALYSIS COMPLETE ---")
+
+         # --- TASK 3: RUN MAX SLOPE (GRADEABILITY) ANALYSIS ---
+        print("\n--- TASK 3: RUNNING MAX SLOPE ANALYSIS (NEWTON-RAPHSON) ---")
+        
+        SPEED_TO_TEST = 70.0 # 70 mph
+        SPEED_TO_TEST_MPS = SPEED_TO_TEST * MPH_TO_MPS
+        GEAR_TO_TEST = 4 # A good climbing gear
+        
+        print(f"\nTesting BASELINE Final Drive: {BASELINE_RATIO:.3f}")
+        max_slope_base = find_max_slope(BASELINE_RATIO, GEAR_TO_TEST, SPEED_TO_TEST_MPS * 3.6)
+        print(f"  > Max Climbable Grade at {SPEED_TO_TEST} mph (Gear {GEAR_TO_TEST}): {max_slope_base:.2f}%")
+        
+        print(f"\nTesting 'OPTIMAL' Final Drive: {optimal_ratio:.3f}")
+        max_slope_opt = find_max_slope(optimal_ratio, GEAR_TO_TEST, SPEED_TO_TEST_MPS * 3.6)
+        print(f"  > Max Climbable Grade at {SPEED_TO_TEST} mph (Gear {GEAR_TO_TEST}): {max_slope_opt:.2f}%")
 
     except ImportError:
         print("\n--- ERROR ---")
-        print("This script requires 'numpy', 'matplotlib', 'scipy', 'pandas', 'osmnx', 'geopandas', 'shapely', 'requests'.")
+        print("This script requires 'numpy', 'matplotlib', 'scipy', 'pandas', and 'requests'.")
         print("Please install them by running:")
-        print("pip install numpy matplotlib scipy pandas osmnx geopandas shapely requests")
+        print("pip install numpy matplotlib scipy pandas requests")
     except Exception as e:
         print(f"\nAn error occurred: {e}")
