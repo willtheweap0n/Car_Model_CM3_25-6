@@ -1,0 +1,582 @@
+import pandas as pd
+import numpy as np
+from scipy.spatial import cKDTree
+import requests
+import osmnx as ox
+import geopandas as gpd
+from shapely.geometry import Point
+import re
+import json
+
+def get_route_from_api(start_coords, end_coords):
+    """
+    Get route data from OSRM API with proper coordinate formatting
+    """
+    print(f"🗺️  Getting route from {start_coords} to {end_coords}...")
+
+    # OSRM expects: longitude,latitude
+    # Format: lon,lat;lon,lat
+    coordinates = f"{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}"
+    osrm_url = f"http://router.project-osrm.org/route/v1/driving/{coordinates}?overview=full&geometries=geojson"
+
+    print(f"   API URL: {osrm_url}")
+
+    try:
+        response = requests.get(osrm_url, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+
+            if 'routes' not in data or len(data['routes']) == 0:
+                print("❌ No route found between these coordinates")
+                return None, None
+
+            # Extract coordinates from OSRM
+            route_coords = data['routes'][0]['geometry']['coordinates']
+
+            print(f"   ✅ Route found: {len(route_coords)} points")
+
+            # Create dense DataFrame (OSRM data)
+            route_data = []
+            for coord in route_coords:
+                route_data.append({
+                    'lon': coord[0],
+                    'lat': coord[1]
+                })
+
+            df_dense = pd.DataFrame(route_data)
+
+            # Get elevation data for sparse points
+            df_sparse = get_elevation_data(df_dense, num_points=50)
+
+            return df_dense, df_sparse
+
+        else:
+            print(f"❌ OSRM API error {response.status_code}: {response.text}")
+            return None, None
+
+    except Exception as e:
+        print(f"❌ API call failed: {e}")
+        return None, None
+
+def get_elevation_data(df_route, num_points=50):
+    """
+    Get elevation data by sampling points from the route
+    """
+    print("⛰️  Generating elevation data...")
+
+    # Sample sparse points from the dense route
+    if len(df_route) > num_points:
+        indices = np.linspace(0, len(df_route)-1, num_points, dtype=int)
+        df_sparse = df_route.iloc[indices].copy()
+    else:
+        df_sparse = df_route.copy()
+
+    # Add realistic synthetic elevation
+    elevation = generate_realistic_elevation(len(df_sparse))
+    df_sparse['elev_m'] = elevation
+
+    return df_sparse
+
+def generate_realistic_elevation(num_points):
+    """
+    Generate realistic elevation profile
+    """
+    x = np.linspace(0, 4*np.pi, num_points)
+    # Create hills and valleys
+    elevation = 50 + 80 * np.sin(x) + 30 * np.sin(2*x + 1) + np.random.normal(0, 8, num_points)
+    elevation = np.maximum(elevation, 10)  # Ensure positive elevation
+    return np.round(elevation, 1)
+
+def enhanced_route_mapper_with_speed_limits():
+    """
+    Main function: Get route from API and analyze speed limits
+    """
+    print("🚗 Enhanced Route Mapper with Speed Limits (MPH)")
+    print("=" * 50)
+
+    # Get user coordinates
+    start_coords, end_coords = get_user_coordinates()
+    if start_coords is None or end_coords is None:
+        return
+
+    # Step 1: Get route data from API
+    print("\n1. Fetching route data from APIs...")
+    df_dense, df_sparse = get_route_from_api(start_coords, end_coords)
+
+    if df_dense is None:
+        print("❌ Failed to get route data. Using fallback sample route...")
+        df_dense, df_sparse = create_fallback_route(start_coords, end_coords)
+        if df_dense is None:
+            return
+
+    print(f"   - Got {len(df_dense)} dense points from OSRM")
+    print(f"   - Got {len(df_sparse)} sparse points with elevation")
+
+    # Step 2: Interpolate elevation onto dense points
+    print("2. Interpolating elevation data...")
+    df_dense = interpolate_elevation(df_dense, df_sparse)
+
+    # Step 3: Add speed limit analysis (in MPH)
+    print("3. Analyzing speed limits for each segment...")
+    df_dense = add_speed_limit_analysis(df_dense)
+
+    # Step 4: Save enhanced dataset
+    output_file = "final_route_highres_elevation_speed_mph.csv"
+    df_dense.to_csv(output_file, index=False)
+
+    # Step 5: Print comprehensive summary
+    print_enhanced_route_summary(df_dense)
+
+    return df_dense
+
+def get_user_coordinates():
+    """
+    Get start and end coordinates from user with better validation
+    """
+    print("📍 Enter route coordinates (latitude, longitude):")
+    print("   Format: latitude,longitude")
+    print("   Example: 51.5074,-0.1278 (London)")
+    print("   Example: 55.9533,-3.1883 (Edinburgh)")
+    print("   Example: 40.7128,-74.0060 (New York)")
+    print()
+
+    # Common cities for easy testing
+    cities = {
+        "1": ("London", (51.5074, -0.1278)),
+        "2": ("Edinburgh", (55.9533, -3.1883)),
+        "3": ("Manchester", (53.4808, -2.2426)),
+        "4": ("New York", (40.7128, -74.0060)),
+        "5": ("Los Angeles", (34.0522, -118.2437)),
+        "6": ("Chicago", (41.8781, -87.6298)),
+        "7": ("Custom", None)
+    }
+
+    print("Choose start city or enter custom coordinates:")
+    for key, (name, coords) in cities.items():
+        if coords:
+            print(f"   {key}. {name}: {coords[0]:.4f}, {coords[1]:.4f}")
+        else:
+            print(f"   {key}. Custom coordinates")
+
+    start_choice = input("\nSelect start (1-7): ").strip()
+
+    if start_choice in cities and start_choice != "7":
+        start_coords = cities[start_choice][1]
+        print(f"   Start: {cities[start_choice][0]} {start_coords}")
+    else:
+        start_input = input("Enter START coordinates (lat,lon): ").strip()
+        start_coords = parse_coordinates(start_input)
+        if start_coords is None:
+            return None, None
+
+    print("\nChoose end city or enter custom coordinates:")
+    for key, (name, coords) in cities.items():
+        if coords:
+            print(f"   {key}. {name}: {coords[0]:.4f}, {coords[1]:.4f}")
+        else:
+            print(f"   {key}. Custom coordinates")
+
+    end_choice = input("\nSelect end (1-7): ").strip()
+
+    if end_choice in cities and end_choice != "7":
+        end_coords = cities[end_choice][1]
+        print(f"   End: {cities[end_choice][0]} {end_coords}")
+    else:
+        end_input = input("Enter END coordinates (lat,lon): ").strip()
+        end_coords = parse_coordinates(end_input)
+        if end_coords is None:
+            return None, None
+
+    print(f"\n   Route: {start_coords} → {end_coords}")
+    return start_coords, end_coords
+
+def parse_coordinates(coord_input):
+    """
+    Parse coordinate input with validation
+    """
+    try:
+        if not coord_input:
+            print("   Using London as default")
+            return (51.5074, -0.1278)
+
+        # Remove any extra spaces and split
+        parts = [part.strip() for part in coord_input.split(',')]
+        if len(parts) != 2:
+            print("❌ Please use format: latitude,longitude")
+            return None
+
+        lat = float(parts[0])
+        lon = float(parts[1])
+
+        # Basic validation
+        if not (-90 <= lat <= 90):
+            print("❌ Latitude must be between -90 and 90")
+            return None
+        if not (-180 <= lon <= 180):
+            print("❌ Longitude must be between -180 and 180")
+            return None
+
+        return (lat, lon)
+
+    except ValueError:
+        print("❌ Please enter valid numbers for coordinates")
+        return None
+
+def create_fallback_route(start_coords, end_coords):
+    """
+    Create a fallback route when API fails
+    """
+    print("   Creating fallback route...")
+
+    # Create a simple straight-line route with some curvature
+    num_points = 200
+
+    # Generate points along great circle path
+    start_lat, start_lon = start_coords
+    end_lat, end_lon = end_coords
+
+    # Simple interpolation with some curvature
+    lats = np.linspace(start_lat, end_lat, num_points)
+    lons = np.linspace(start_lon, end_lon, num_points)
+
+    # Add some realistic curvature
+    t = np.linspace(0, np.pi, num_points)
+    curve_strength = 0.1 * (end_lon - start_lon)  # Adaptive curvature
+    lons = lons + curve_strength * np.sin(t)
+
+    df_dense = pd.DataFrame({
+        'lat': lats,
+        'lon': lons
+    })
+
+    # Create sparse points with elevation
+    df_sparse = get_elevation_data(df_dense, num_points=50)
+
+    return df_dense, df_sparse
+
+def interpolate_elevation(df_dense, df_sparse):
+    """
+    Interpolate elevation from sparse points to dense points
+    """
+    # Build KD-tree for elevation interpolation
+    tree = cKDTree(df_sparse[["lon", "lat"]].values)
+
+    # For each dense point, find the nearest sparse (elevation) point
+    distances, indices = tree.query(df_dense[["lon", "lat"]].values, k=1)
+
+    # Assign interpolated elevation
+    df_dense["elev_m"] = df_sparse.iloc[indices]["elev_m"].values
+
+    # Smooth elevations to remove step changes
+    df_dense["elev_m"] = df_dense["elev_m"].rolling(window=5, center=True, min_periods=1).mean()
+
+    return df_dense
+
+def add_speed_limit_analysis(df_route):
+    """
+    Add speed limit analysis to the route dataframe (in MPH)
+    """
+    # Calculate distances between points
+    df_route = calculate_point_distances(df_route)
+
+    # Segment the route based on point characteristics
+    df_route = segment_route(df_route)
+
+    # Assign speed limits to segments (in MPH)
+    df_route = assign_speed_limits_mpH(df_route)
+
+    # Enhance with OpenStreetMap data if available
+    df_route = enhance_with_osm_speeds_mpH(df_route)
+
+    return df_route
+
+def calculate_point_distances(df_route):
+    """
+    Calculate distances between consecutive points
+    """
+    distances = np.zeros(len(df_route))
+    for i in range(len(df_route)-1):
+        lat1, lon1 = df_route.iloc[i][['lat', 'lon']]
+        lat2, lon2 = df_route.iloc[i+1][['lat', 'lon']]
+        distances[i] = haversine_distance(lat1, lon1, lat2, lon2)
+
+    df_route['distance_to_next_m'] = distances
+    return df_route
+
+def segment_route(df_route):
+    """
+    Group points into logical segments based on characteristics
+    """
+    print("   - Segmenting route into logical sections...")
+
+    df_route['segment_id'] = 0
+    df_route['segment_type'] = 'unknown'
+
+    current_segment = 0
+    segment_start = 0
+
+    min_segment_length = 5
+
+    for i in range(1, len(df_route)):
+        segment_length = i - segment_start
+
+        # Check if we should start a new segment
+        new_segment = False
+
+        if segment_length >= min_segment_length:
+            # Check point spacing variation
+            recent_distances = df_route.iloc[max(segment_start, i-5):i]['distance_to_next_m']
+            if len(recent_distances) > 1 and np.std(recent_distances) > 50:
+                new_segment = True
+
+            # Check elevation changes
+            recent_elevations = df_route.iloc[max(segment_start, i-5):i]['elev_m']
+            if len(recent_elevations) > 1 and abs(recent_elevations.iloc[-1] - recent_elevations.iloc[0]) > 15:
+                new_segment = True
+
+            # Maximum segment length
+            if segment_length >= 30:
+                new_segment = True
+
+        if new_segment:
+            # Classify and assign current segment
+            segment_points = df_route.iloc[segment_start:i]
+            segment_type = classify_segment(segment_points)
+            df_route.loc[segment_start:i, 'segment_id'] = current_segment
+            df_route.loc[segment_start:i, 'segment_type'] = segment_type
+
+            current_segment += 1
+            segment_start = i
+
+    # Handle the last segment
+    if segment_start < len(df_route):
+        segment_points = df_route.iloc[segment_start:]
+        segment_type = classify_segment(segment_points)
+        df_route.loc[segment_start:, 'segment_id'] = current_segment
+        df_route.loc[segment_start:, 'segment_type'] = segment_type
+
+    print(f"   - Created {current_segment + 1} segments")
+    return df_route
+
+def classify_segment(segment_df):
+    """
+    Classify segment type based on characteristics
+    """
+    if len(segment_df) < 2:
+        return 'unknown'
+
+    avg_distance = segment_df['distance_to_next_m'].mean()
+    total_distance = segment_df['distance_to_next_m'].sum()
+    elev_std = segment_df['elev_m'].std()
+
+    if avg_distance > 80 and total_distance > 800:
+        return 'highway'
+    elif avg_distance > 50:
+        return 'primary'
+    elif elev_std > 12:
+        return 'hilly'
+    elif total_distance < 300:
+        return 'urban'
+    else:
+        return 'secondary'
+
+def assign_speed_limits_mpH(df_route):
+    """
+    Assign speed limits based on segment characteristics (in MPH)
+    """
+    print("   - Assigning speed limits to segments (MPH)...")
+
+    # Speed limits in MPH (converted from typical km/h values)
+    speed_limits_mpH = {
+        'highway': 70,    # ~110 km/h
+        'primary': 50,    # ~80 km/h
+        'secondary': 40,  # ~60 km/h
+        'hilly': 30,      # ~50 km/h
+        'urban': 20,      # ~30 km/h
+        'unknown': 30     # ~50 km/h
+    }
+
+    df_route['speed_limit_mph'] = df_route['segment_type'].map(speed_limits_mpH)
+    return df_route
+
+def enhance_with_osm_speeds_mpH(df_route):
+    """
+    Enhance speed limits with OpenStreetMap data (handling both MPH and KM/H)
+    """
+    print("   - Enhancing with OpenStreetMap data...")
+
+    try:
+        # Create geometry for spatial analysis
+        geometry = [Point(lon, lat) for lon, lat in zip(df_route['lon'], df_route['lat'])]
+        gdf_route = gpd.GeoDataFrame(df_route, geometry=geometry, crs='EPSG:4326')
+
+        # Get bounding box with buffer
+        bounds = gdf_route.total_bounds
+        buffer_degree = 0.02
+
+        north, south, east, west = (bounds[3] + buffer_degree, bounds[1] - buffer_degree,
+                                  bounds[2] + buffer_degree, bounds[0] - buffer_degree)
+
+        # Download road network
+        G = ox.graph_from_bbox(north, south, east, west, network_type='drive')
+        gdf_roads = ox.graph_to_gdfs(G, nodes=False)
+        gdf_roads = gdf_roads.to_crs(gdf_route.crs)
+
+        # Spatial join to find nearest roads
+        gdf_joined = gpd.sjoin_nearest(gdf_route, gdf_roads[['maxspeed', 'highway', 'geometry']],
+                                     how='left', distance_col='distance_to_road')
+
+        # Parse OSM speed limits and convert to MPH
+        def parse_osm_speed_to_mph(speed_str):
+            if pd.isna(speed_str):
+                return None
+            if isinstance(speed_str, (int, float)):
+                return kmh_to_mph(float(speed_str))
+
+            speed_str = str(speed_str).lower()
+
+            if 'mph' in speed_str:
+                # Already in MPH, just extract the number
+                numbers = re.findall(r'\d+', speed_str)
+                if numbers:
+                    return float(numbers[0])
+            elif any(x in speed_str for x in ['kmh', 'km/h']):
+                # Convert KM/H to MPH
+                numbers = re.findall(r'\d+', speed_str)
+                if numbers:
+                    kmh_value = float(numbers[0])
+                    return kmh_to_mph(kmh_value)
+            elif speed_str.isdigit():
+                # Assume KM/H if no unit specified (common in OSM)
+                kmh_value = float(speed_str)
+                return kmh_to_mph(kmh_value)
+
+            return None
+
+        # Apply OSM speed limits where available
+        gdf_joined['osm_speed_limit_mph'] = gdf_joined['maxspeed'].apply(parse_osm_speed_to_mph)
+
+        # Update with OSM data
+        valid_osm_mask = gdf_joined['osm_speed_limit_mph'].notna()
+        df_route.loc[valid_osm_mask, 'speed_limit_mph'] = gdf_joined.loc[valid_osm_mask, 'osm_speed_limit_mph']
+
+        osm_updates = valid_osm_mask.sum()
+        print(f"   - Updated {osm_updates} points with OSM speed limits")
+
+    except Exception as e:
+        print(f"   - OSM enhancement skipped: {e}")
+
+    return df_route
+
+def kmh_to_mph(kmh):
+    """
+    Convert kilometers per hour to miles per hour
+    """
+    return round(kmh * 0.621371, 1)
+
+def mph_to_kmh(mph):
+    """
+    Convert miles per hour to kilometers per hour
+    """
+    return round(mph * 1.60934, 1)
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate great-circle distance between two points in meters
+    """
+    R = 6371000  # Earth radius in meters
+
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    delta_phi = np.radians(lat2 - lat1)
+    delta_lambda = np.radians(lon2 - lon1)
+
+    a = np.sin(delta_phi/2)**2 + np.cos(phi1)*np.cos(phi2)*np.sin(delta_lambda/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+
+    return R * c
+
+def print_enhanced_route_summary(df_route):
+    """
+    Print comprehensive summary of the enhanced route (in MPH)
+    """
+    print("\n" + "="*60)
+    print("📊 ENHANCED ROUTE SUMMARY (MPH)")
+    print("="*60)
+
+    total_points = len(df_route)
+    total_distance_m = df_route['distance_to_next_m'].sum()
+    total_distance_miles = total_distance_m / 1609.34  # Convert meters to miles
+
+    print(f"Total Points: {total_points}")
+    print(f"Total Distance: {total_distance_m/1000:.2f} km ({total_distance_miles:.2f} miles)")
+    print(f"Elevation Range: {df_route['elev_m'].min():.1f} - {df_route['elev_m'].max():.1f} m")
+
+    # Segment summary
+    segment_summary = df_route.groupby(['segment_id', 'segment_type']).agg({
+        'lat': 'count',
+        'distance_to_next_m': 'sum',
+        'speed_limit_mph': 'first',
+        'elev_m': ['min', 'max', 'mean']
+    }).round(1)
+
+    segment_summary.columns = ['points', 'length_m', 'speed_mph', 'elev_min', 'elev_max', 'elev_mean']
+    segment_summary['length_miles'] = (segment_summary['length_m'] / 1609.34).round(3)
+    segment_summary['length_km'] = (segment_summary['length_m'] / 1000).round(3)
+
+    print(f"\nSegments: {len(segment_summary)}")
+    print("\nSegment Details:")
+    print("-" * 90)
+    print(f"{'ID':<3} {'Type':<12} {'Points':<8} {'Length (mi)':<12} {'Speed':<8} {'Elevation (m)':<20}")
+    print("-" * 90)
+
+    for (seg_id, seg_type), row in segment_summary.iterrows():
+        elev_range = f"{row['elev_min']}-{row['elev_max']} (avg: {row['elev_mean']})"
+        print(f"{seg_id:<3} {seg_type:<12} {row['points']:<8} {row['length_miles']:<12} "
+              f"{row['speed_mph']:<8} mph {elev_range:<20}")
+
+    # Speed limit distribution
+    speed_stats = df_route['speed_limit_mph'].value_counts().sort_index()
+    print(f"\nSpeed Limit Distribution (MPH):")
+    print("-" * 35)
+    for speed, count in speed_stats.items():
+        percentage = (count / total_points) * 100
+        kmh_equivalent = mph_to_kmh(speed)
+        print(f"  {speed} mph ({kmh_equivalent} km/h): {count} points ({percentage:.1f}%)")
+
+    avg_speed_limit_mph = df_route['speed_limit_mph'].mean()
+    avg_speed_limit_kmh = mph_to_kmh(avg_speed_limit_mph)
+    print(f"\nAverage Speed Limit: {avg_speed_limit_mph:.1f} mph ({avg_speed_limit_kmh:.1f} km/h)")
+
+    # Save segment summary
+    segment_summary.to_csv("route_segments_detailed_mph.csv")
+    print(f"\n💾 Detailed segment analysis saved to: route_segments_detailed_mph.csv")
+
+# Run the enhanced route mapper
+if __name__ == "__main__":
+    try:
+        df_enhanced = enhanced_route_mapper_with_speed_limits()
+
+        if df_enhanced is not None:
+            print(f"\n✅ Enhanced route mapping complete!")
+            print(f"📁 Output files created:")
+            print(f"   - final_route_highres_elevation_speed_mph.csv")
+            print(f"   - route_segments_detailed_mph.csv")
+
+            # Show sample of the enhanced data
+            print(f"\n📋 Sample of enhanced data (first 5 points):")
+            sample_cols = ['lon', 'lat', 'elev_m', 'speed_limit_mph', 'segment_id', 'segment_type']
+            print(df_enhanced[sample_cols].head().to_string(index=False))
+
+            # Show conversion table for reference
+            print(f"\n📐 Speed Conversion Reference:")
+            print("-" * 30)
+            common_speeds = [20, 30, 40, 50, 60, 70]
+            for mph in common_speeds:
+                kmh = mph_to_kmh(mph)
+                print(f"  {mph} mph = {kmh} km/h")
+
+    except Exception as e:
+        print(f"❌ Error in enhanced route mapping: {e}")
+        import traceback
+        traceback.print_exc()
