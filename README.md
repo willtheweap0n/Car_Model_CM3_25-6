@@ -25,18 +25,40 @@ User must have Python 3.x and install the libraries numpy, matplotlib, requests,
 If route is going to be changed then new API key may be needed, this can be done by registering to with openrouteservice.org
 
 Configuration of Car
+
 Vehicle can be configured for certain specifications, although engine must remain the same.
 the following parameters can be modified for different cars:
+
 Vehicle mass
+
 Frontal area
+
 Drag Coefficient 
+
 Rolling Resistance Coefficient
+
 Wheel radius
+
 Gear Ratios
-Route Start and End coordinates.
 
 Configuration of route.
+
 Route Start and End coordinates can be changed in the configuration section
 In order to accurately change the route speed limit data will need to be gathered manually and changed in the manual speed limit section.
 
 Configuration of Driver.
+
+Currently acceleration is set to occur at 80% of max torque. this can be changed in the get_engine_torque function.
+
+What happens during execution:
+Route Generation: The script checks for final_route_data.csv. If missing, it queries the API, processes the speed limits, and saves the file.
+
+Baseline Simulation: It runs the simulation using your BASE_FINAL_DRIVE_RATIO.
+
+Optimization Loop: It tests various ratios (between 2.0 and 4.5) to find the lowest fuel cost.
+
+Performance Check: It calculates the Top Speed and Max Slope for both the Baseline and the New Optimal ratio.
+
+Outputs should include route data, optimum gear ratio and attempts, max speed and max slope at 70mph.
+
+To run code simply 
