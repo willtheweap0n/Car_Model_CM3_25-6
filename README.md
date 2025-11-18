@@ -51,6 +51,7 @@ Configuration of Driver.
 Currently acceleration is set to occur at 80% of max torque. this can be changed in the get_engine_torque function.
 
 What happens during execution:
+
 Route Generation: The script checks for final_route_data.csv. If missing, it queries the API, processes the speed limits, and saves the file.
 
 Baseline Simulation: It runs the simulation using your BASE_FINAL_DRIVE_RATIO.
@@ -61,4 +62,12 @@ Performance Check: It calculates the Top Speed and Max Slope for both the Baseli
 
 Outputs should include route data, optimum gear ratio and attempts, max speed and max slope at 70mph.
 
-To run code simply 
+To run code simply run the python script.
+
+troubleshooting
+
+"Newton-Raphson failed to converge": This usually happens if the vehicle physics are impossible (e.g., trying to climb a 20% grade in 6th gear with a heavy car). The physics solver cannot find a valid equilibrium.
+
+"ORS API Error": Check your internet connection and ensure your API Key is valid.
+
+Simulation Cost 0.0 L: This means the simulation failed to calculate valid engine operating points (likely the RPM dropped below MIN_ENGINE_RPM or torque required exceeded the engine's max capability). Check your gear ratios.
