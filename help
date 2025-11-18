@@ -1,0 +1,829 @@
+import math
+import os
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+from scipy.interpolate import interp1d, RectBivariateSpline
+from scipy.integrate import solve_ivp
+from scipy.optimize import minimize_scalar
+
+# --- 1. CONFIGURATION (Constants & Vehicle Data) ---
+GRAVITY_MPS2 = 9.81
+AIR_DENSITY_KGM3 = 1.225
+FUEL_DENSITY_GPL = 743.0
+EARTH_RADIUS_M = 6371000
+VEHICLE_MASS_KG = 1400.0
+FRONTAL_AREA_M2 = 2.2
+DRAG_COEFFICIENT = 0.3
+ROLLING_RESISTANCE_COEFFICIENT = 0.015
+TIRE_RADIUS_M = 0.323
+
+# Transmission
+FIXED_GEAR_RATIOS_LIST = [3.70, 1.95, 1.30, 1.03, 0.84, 0.68]
+FIXED_GEAR_RATIOS_DICT = {
+    i + 1: ratio for i, ratio in enumerate(FIXED_GEAR_RATIOS_LIST)
+}
+BASE_FINAL_DRIVE_RATIO = 3.85
+BASELINE_RATIO = 3.85
+
+# Engine Constraints
+MIN_ENGINE_RPM = 800.0
+MAX_ENGINE_RPM = 6800.0
+
+# Conversions
+MPH_TO_MPS = 0.44704
+
+# File & API
+ROUTE_FILENAME = "final_route_data.csv"
+OUTPUT_FILENAME = "final_route_data.csv"
+# Note: Ideally, store API keys in environment variables
+API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImJmMWQ0ZjgyNmNhZTRjZjA5M2I5ODAzMDkyZTY1MTJjIiwiaCI6Im11cm11cjY0In0="
+
+# Route Points
+START_COORDS = (55.9533, -3.1883)  # Edinburgh (lat, lon)
+END_COORDS = (55.8642, -4.2518)    # Glasgow (lat, lon)
+
+# --- SPEED LIMIT CONFIGURATION ---
+SPEED_LIMIT_DEFAULT_MPH = 70.0
+
+# Rules for the END of the route (Distance REMAINING -> Speed Limit)
+# These are processed FIRST (highest priority).
+MANUAL_SPEED_LIMITS_END = [
+    (2.0, 20.0),  # Final 2k
+    (3.0, 30.0),  # 3k to 2k from end
+    (8.0, 40.0)   # 8k to 3k from end
+]
+
+# Rules for the START of the route (Distance from Start -> Speed Limit)
+MANUAL_SPEED_LIMITS_START = [
+    (10.0, 20.0),  # 0-10km
+    (12.0, 30.0),  # 10-12km
+    (13.0, 40.0),  # 12-13km
+    (14.0, 50.0)   # 13-14km
+]
+
+
+# --- 2. HELPER FUNCTIONS ---
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate great-circle distance between two points in meters."""
+    r_earth = EARTH_RADIUS_M
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    delta_phi = np.radians(lat2 - lat1)
+    delta_lambda = np.radians(lon2 - lon1)
+    
+    a = (np.sin(delta_phi / 2)**2 +
+         np.cos(phi1) * np.cos(phi2) * np.sin(delta_lambda / 2)**2)
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return r_earth * c
+
+
+def calculate_point_distances(df_route):
+    """Calculate distances between consecutive points."""
+    print("   - Calculating point-to-point distances...")
+    distances = np.zeros(len(df_route))
+    lats = df_route['lat'].values
+    lons = df_route['lon'].values
+
+    for i in range(len(df_route) - 1):
+        distances[i] = haversine_distance(
+            lats[i], lons[i], lats[i + 1], lons[i + 1]
+        )
+
+    df_route['distance_to_next_m'] = distances
+    return df_route
+
+
+def kmh_to_mph(kmh):
+    return round(kmh * 0.621371, 1)
+
+
+def mph_to_kmh(mph):
+    return round(mph * 1.60934, 1)
+
+
+# --- 3. CORE ENGINE MODEL (INTERPOLATION) ---
+get_fuel_flow = None
+get_max_torque = None
+get_min_torque = None
+
+
+def setup_engine_model():
+    """Loads all EPA log data and returns interpolation functions."""
+    global get_fuel_flow, get_max_torque, get_min_torque
+    
+    speed_rads_axis = np.array([
+        0.0, 36.6, 77.9, 88.7, 96.6, 104.6, 131.2, 156.9, 182.5,
+        209.3, 259.3, 310.9, 363.7, 415.8, 470.8, 562.9, 654.5, 680.7
+    ])
+    
+    torque_nm_axis = np.array([
+        -39.9, -37.9, -22.2, 2.2, 9.7, 19.4, 29.6, 39.7, 44.7, 49.6,
+        59.7, 69.6, 79.6, 89.7, 99.5, 109.8, 119.6, 129.5, 138.6,
+        150.3, 169.7, 183.1, 195.9, 211.5
+    ])
+
+    # Formatted for PEP 8 readability (broken into chunks)
+    fuel_gps_map = np.array([
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.06, 0.09],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.12, 0.15],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.03, 0.06, 0.09, 0.17, 0.29, 0.45, 0.61, 0.66],
+        [0.02, 0.07, 0.12, 0.13, 0.14, 0.15, 0.19, 0.22, 0.26, 0.30, 0.37, 0.47, 0.59, 0.71, 0.86, 1.13, 1.39, 1.47],
+        [0.03, 0.08, 0.15, 0.16, 0.18, 0.19, 0.24, 0.28, 0.33, 0.38, 0.47, 0.58, 0.72, 0.86, 1.04, 1.34, 1.64, 1.72],
+        [0.04, 0.11, 0.19, 0.21, 0.23, 0.24, 0.30, 0.35, 0.42, 0.48, 0.59, 0.72, 0.88, 1.06, 1.28, 1.62, 1.95, 2.05],
+        [0.05, 0.14, 0.24, 0.26, 0.28, 0.30, 0.36, 0.43, 0.50, 0.58, 0.71, 0.87, 1.07, 1.30, 1.53, 1.91, 2.29, 2.40],
+        [0.06, 0.16, 0.28, 0.31, 0.33, 0.35, 0.43, 0.50, 0.58, 0.67, 0.84, 1.02, 1.26, 1.53, 1.77, 2.21, 2.64, 2.76],
+        [0.06, 0.17, 0.29, 0.33, 0.35, 0.37, 0.46, 0.54, 0.63, 0.72, 0.90, 1.10, 1.36, 1.64, 1.90, 2.35, 2.81, 2.94],
+        [0.06, 0.18, 0.31, 0.35, 0.37, 0.40, 0.49, 0.58, 0.67, 0.77, 0.97, 1.18, 1.45, 1.75, 2.02, 2.50, 2.97, 3.11],
+        [0.06, 0.20, 0.35, 0.39, 0.42, 0.45, 0.55, 0.66, 0.76, 0.87, 1.10, 1.35, 1.64, 1.97, 2.28, 2.80, 3.32, 3.47],
+        [0.07, 0.22, 0.39, 0.44, 0.47, 0.51, 0.62, 0.74, 0.86, 0.99, 1.24, 1.52, 1.83, 2.18, 2.53, 3.09, 3.67, 3.84],
+        [0.08, 0.25, 0.44, 0.49, 0.53, 0.57, 0.69, 0.82, 0.96, 1.11, 1.38, 1.68, 2.03, 2.40, 2.78, 3.39, 4.03, 4.21],
+        [0.10, 0.28, 0.50, 0.55, 0.59, 0.63, 0.77, 0.92, 1.07, 1.23, 1.53, 1.85, 2.22, 2.62, 3.02, 3.70, 4.40, 4.61],
+        [0.12, 0.32, 0.56, 0.62, 0.66, 0.71, 0.86, 1.01, 1.17, 1.34, 1.67, 2.01, 2.42, 2.84, 3.26, 4.00, 4.77, 4.99],
+        [0.15, 0.37, 0.63, 0.69, 0.74, 0.79, 0.95, 1.11, 1.28, 1.48, 1.82, 2.19, 2.63, 3.07, 3.52, 4.33, 5.17, 5.41],
+        [0.19, 0.43, 0.70, 0.77, 0.83, 0.88, 1.06, 1.23, 1.39, 1.57, 1.96, 2.36, 2.84, 3.30, 3.78, 4.64, 5.55, 5.81],
+        [0.23, 0.49, 0.79, 0.86, 0.92, 0.98, 1.18, 1.37, 1.54, 1.71, 2.10, 2.55, 3.03, 3.52, 4.04, 4.98, 5.95, 6.23],
+        [0.28, 0.56, 0.87, 0.95, 1.01, 1.07, 1.28, 1.48, 1.67, 1.84, 2.24, 2.72, 3.22, 3.73, 4.29, 5.31, 6.32, 6.61],
+        [0.34, 0.64, 0.99, 1.07, 1.14, 1.20, 1.41, 1.61, 1.81, 2.02, 2.46, 2.95, 3.47, 4.03, 4.65, 5.74, 6.81, 7.12],
+        [0.42, 0.79, 1.20, 1.31, 1.39, 1.47, 1.73, 1.97, 2.20, 2.39, 2.98, 3.50, 4.02, 4.69, 5.41, 6.55, 7.65, 7.96],
+        [0.47, 0.88, 1.35, 1.48, 1.57, 1.66, 1.96, 2.25, 2.54, 2.84, 3.50, 4.02, 4.67, 5.32, 6.02, 7.15, 8.24, 8.55],
+        [0.50, 0.97, 1.50, 1.64, 1.74, 1.84, 2.18, 2.51, 2.85, 3.20, 3.85, 4.47, 5.28, 5.97, 6.64, 7.74, 8.81, 9.11],
+        [0.54, 1.08, 1.68, 1.84, 1.95, 2.07, 2.46, 2.84, 3.21, 3.60, 4.32, 5.10, 5.94, 6.70, 7.42, 8.48, 9.51, 9.80]
+    ])
+
+    rads_to_rpm = 60 / (2 * np.pi)
+    
+    wot_speed_rads = np.array(
+        [0.0, 95.0, 157.2, 178.0, 209.5, 235.7, 256.4, 282.7, 314.1, 356.1, 429.4, 628.3, 680.7]
+    )
+    wot_torque_nm = np.array(
+        [0.0, 134.6, 164.9, 167.8, 187.9, 188.3, 182.3, 188.2, 201.4, 197.4, 200.1, 184.0, 0.0]
+    )
+    
+    ct_speed_rads = np.array([0.0, 146.6, 403.2, 424.0, 465.8, 680.7])
+    ct_torque_nm = np.array([-16.0, -20.6, -28.8, -33.5, -35.0, -42.7])
+
+    # Create interpolators
+    _get_fuel_flow = RectBivariateSpline(
+        torque_nm_axis, speed_rads_axis, fuel_gps_map, kx=1, ky=1
+    )
+    _get_max_torque = interp1d(
+        wot_speed_rads * rads_to_rpm, wot_torque_nm,
+        kind='linear', bounds_error=False, fill_value=0.0
+    )
+    _get_min_torque = interp1d(
+        ct_speed_rads * rads_to_rpm, ct_torque_nm,
+        kind='linear', bounds_error=False, fill_value=-16.0
+    )
+
+    def get_fuel_flow_gps(rpm, torque):
+        rads = rpm * (2 * np.pi / 60)
+        torque_clipped = np.clip(torque, torque_nm_axis[0], torque_nm_axis[-1])
+        rads_clipped = np.clip(rads, speed_rads_axis[0], speed_rads_axis[-1])
+        return _get_fuel_flow(torque_clipped, rads_clipped)[0][0]
+
+    get_fuel_flow = get_fuel_flow_gps
+    get_max_torque = _get_max_torque
+    get_min_torque = _get_min_torque
+    print("Engine model setup complete.")
+
+
+# --- 4. CORE PHYSICS FUNCTIONS ---
+
+def get_engine_rpm_from_speed(speed_mps, gear_ratio, final_drive):
+    """Calculate engine RPM based on vehicle speed and gear ratios."""
+    if TIRE_RADIUS_M == 0:
+        return 0
+    wheel_rpm = (speed_mps / (2 * math.pi * TIRE_RADIUS_M)) * 60
+    engine_rpm = wheel_rpm * gear_ratio * final_drive
+    return max(MIN_ENGINE_RPM, engine_rpm)
+
+
+def calculate_resistance_forces(speed_mps, slope_percent):
+    """Calculate total resistance forces (Drag, Rolling, Gravity)."""
+    f_drag = 0.5 * AIR_DENSITY_KGM3 * FRONTAL_AREA_M2 * DRAG_COEFFICIENT * (speed_mps ** 2)
+    f_rolling = ROLLING_RESISTANCE_COEFFICIENT * VEHICLE_MASS_KG * GRAVITY_MPS2
+    
+    slope_angle_rad = math.atan(slope_percent / 100.0)
+    f_gravity = VEHICLE_MASS_KG * GRAVITY_MPS2 * math.sin(slope_angle_rad)
+    
+    return f_drag + f_rolling + f_gravity
+
+
+# --- 5. ROUTE PRE-PROCESSING ---
+PROCESSED_ROUTE = []
+
+
+def preprocess_route():
+    """Loads route CSV and processes it into micro-segments."""
+    global PROCESSED_ROUTE
+    PROCESSED_ROUTE = []
+
+    print(f"Pre-processing route data from '{ROUTE_FILENAME}'...")
+
+    try:
+        df_route = pd.read_csv(ROUTE_FILENAME)
+    except FileNotFoundError:
+        print(f"❌ ERROR: Route file not found: '{ROUTE_FILENAME}'")
+        print("Please run this script's `create_route_file()` function first.")
+        return False
+    except Exception as e:
+        print(f"❌ ERROR: Could not read route file: {e}")
+        return False
+
+    # Create a segment for EVERY POINT
+    df_route['elev_next'] = df_route['elev_m'].shift(-1)
+    df_route['elev_change_m'] = df_route['elev_next'] - df_route['elev_m']
+    df_route['dist_to_next_safe'] = df_route['distance_to_next_m'].replace(0, 1e-6)
+    df_route['slope_pct'] = (
+        df_route['elev_change_m'] / df_route['dist_to_next_safe']
+    ) * 100
+    df_route['speed_limit_mps'] = df_route['speed_limit_mph'] * MPH_TO_MPS
+    df_route = df_route.iloc[:-1]  # Drop the last row (no "next point")
+
+    PROCESSED_ROUTE = list(zip(
+        df_route['distance_to_next_m'],
+        df_route['slope_pct'],
+        df_route['speed_limit_mps']
+    ))
+
+    total_dist_km = sum([seg[0] for seg in PROCESSED_ROUTE]) / 1000.0
+    print(f"Route pre-processed. {len(PROCESSED_ROUTE)} micro-segments. "
+          f"Total distance: {total_dist_km:.1f} km")
+    return True
+
+
+# --- 6. HYBRID SIMULATION "MINI-FUNCTIONS" ---
+_cruise_cache_key = None
+_cruise_cache_solution = (0.0, 0.0)  # (fuel_flow_gps, time_per_meter)
+
+
+def clear_cruise_cache():
+    global _cruise_cache_key, _cruise_cache_solution
+    _cruise_cache_key = None
+    _cruise_cache_solution = (0.0, 0.0)
+
+
+def simulate_cruise(speed_mps, slope_pct, distance_m, final_drive_ratio):
+    """NON-ODE calculation for the constant-speed cruise part."""
+    global _cruise_cache_key, _cruise_cache_solution
+
+    cache_key = (speed_mps, slope_pct, final_drive_ratio)
+    
+    if cache_key == _cruise_cache_key:
+        (fuel_flow_gps, time_per_meter) = _cruise_cache_solution
+    else:
+        f_resistance = calculate_resistance_forces(speed_mps, slope_pct)
+        wheel_torque_req = f_resistance * TIRE_RADIUS_M
+        best_fuel_flow = float('inf')
+
+        for gear, ratio in FIXED_GEAR_RATIOS_DICT.items():
+            rpm = get_engine_rpm_from_speed(speed_mps, ratio, final_drive_ratio)
+            if rpm < MIN_ENGINE_RPM or rpm > MAX_ENGINE_RPM:
+                continue
+
+            engine_tq_req = (wheel_torque_req) / (ratio * final_drive_ratio)
+
+            if (engine_tq_req < get_min_torque(rpm) or
+                    engine_tq_req > get_max_torque(rpm)):
+                continue
+
+            current_fuel_flow = get_fuel_flow(rpm, engine_tq_req)
+            if engine_tq_req < 0:
+                current_fuel_flow = 0.0  # DFCO (Deceleration Fuel Cut Off)
+
+            if current_fuel_flow < best_fuel_flow:
+                best_fuel_flow = current_fuel_flow
+
+        fuel_flow_gps = best_fuel_flow
+        if fuel_flow_gps == float('inf'):
+            fuel_flow_gps = 0.0
+
+        time_per_meter = 1.0 / speed_mps if speed_mps > 0.01 else 0.0
+
+        _cruise_cache_key = cache_key
+        _cruise_cache_solution = (fuel_flow_gps, time_per_meter)
+
+    time_taken_sec = 0.0
+    fuel_used_grams = 0.0
+    if speed_mps > 0.01:
+        time_taken_sec = time_per_meter * distance_m
+        fuel_used_grams = fuel_flow_gps * time_taken_sec
+
+    return fuel_used_grams, time_taken_sec
+
+
+def _accel_ode_model(t, y, slope_pct, final_drive_ratio):
+    """The physics model *only* for acceleration at 80% torque."""
+    speed_mps = max(0.1, y[0])
+    best_power_gear_ratio = FIXED_GEAR_RATIOS_LIST[0]
+    max_possible_wheel_torque = -float('inf')
+
+    for gear, ratio in FIXED_GEAR_RATIOS_DICT.items():
+        rpm = get_engine_rpm_from_speed(speed_mps, ratio, final_drive_ratio)
+        if rpm > MAX_ENGINE_RPM:
+            continue
+        engine_tq_max = get_max_torque(rpm)
+        wheel_tq = (engine_tq_max * ratio * final_drive_ratio)
+        if wheel_tq > max_possible_wheel_torque:
+            max_possible_wheel_torque = wheel_tq
+            best_power_gear_ratio = ratio
+
+    rpm_at_max_power = get_engine_rpm_from_speed(
+        speed_mps, best_power_gear_ratio, final_drive_ratio
+    )
+    engine_torque_req = get_max_torque(rpm_at_max_power) * 0.80
+    fuel_flow_gps = get_fuel_flow(rpm_at_max_power, engine_torque_req)
+
+    f_tractive = (
+        (engine_torque_req * best_power_gear_ratio * final_drive_ratio) /
+        TIRE_RADIUS_M
+    )
+    f_resistance = calculate_resistance_forces(speed_mps, slope_pct)
+    f_net = f_tractive - f_resistance
+    acceleration_mps2 = f_net / VEHICLE_MASS_KG
+
+    return [acceleration_mps2, fuel_flow_gps, speed_mps]
+
+
+def simulate_acceleration(start_speed_mps, target_speed_mps,
+                          slope_pct, final_drive_ratio):
+    """The ODE 'mini-simulator' for the acceleration part."""
+    initial_state = [start_speed_mps, 0.0, 0.0]
+
+    def hit_target_speed(t, y, slope_pct, final_drive_ratio):
+        return y[0] - target_speed_mps
+
+    hit_target_speed.terminal = True
+    hit_target_speed.direction = 1
+
+    sol = solve_ivp(
+        _accel_ode_model, [0, 30], initial_state, method='RK23',
+        events=hit_target_speed,
+        args=(slope_pct, final_drive_ratio),
+        dense_output=True
+    )
+
+    if not sol.success or len(sol.y[0]) < 2:
+        return 0.0, 0.0, 0.0, start_speed_mps
+
+    fuel_used_grams = sol.y[1][-1]
+    time_taken_sec = sol.t[-1]
+    distance_covered_m = sol.y[2][-1]
+    final_speed_mps = sol.y[0][-1]
+
+    return fuel_used_grams, time_taken_sec, distance_covered_m, final_speed_mps
+
+
+# --- 7. HYBRID SIMULATION ENGINE ---
+
+def run_segment_simulation(final_drive_ratio):
+    """Loops through route segments to calculate total fuel/time."""
+    total_fuel_grams = 0.0
+    total_time_sec = 0.0
+    current_speed_mps = 0.0
+
+    for (seg_dist_m, seg_slope_pct, seg_speed_limit_mps) in PROCESSED_ROUTE:
+        target_speed_mps = seg_speed_limit_mps
+
+        if target_speed_mps > current_speed_mps:
+            (fuel_g, time_s, dist_m, final_speed) = simulate_acceleration(
+                current_speed_mps, target_speed_mps,
+                seg_slope_pct, final_drive_ratio
+            )
+            total_fuel_grams += fuel_g
+            total_time_sec += time_s
+            current_speed_mps = final_speed
+
+            remaining_distance_m = seg_dist_m - dist_m
+            if remaining_distance_m > 0:
+                (fuel_g_cruise, time_s_cruise) = simulate_cruise(
+                    current_speed_mps, seg_slope_pct,
+                    remaining_distance_m, final_drive_ratio
+                )
+                total_fuel_grams += fuel_g_cruise
+                total_time_sec += time_s_cruise
+
+        elif target_speed_mps < current_speed_mps:
+            current_speed_mps = target_speed_mps
+            (fuel_g_cruise, time_s_cruise) = simulate_cruise(
+                current_speed_mps, seg_slope_pct,
+                seg_dist_m, final_drive_ratio
+            )
+            total_fuel_grams += fuel_g_cruise
+            total_time_sec += time_s_cruise
+
+        else:
+            (fuel_g_cruise, time_s_cruise) = simulate_cruise(
+                current_speed_mps, seg_slope_pct,
+                seg_dist_m, final_drive_ratio
+            )
+            total_fuel_grams += fuel_g_cruise
+            total_time_sec += time_s_cruise
+
+    return total_fuel_grams / FUEL_DENSITY_GPL
+
+
+# --- 8. OPTIMIZATION PROBLEM SETUP ---
+
+def objective_function(final_drive_ratio):
+    """The 'Worker' function called by the optimizer."""
+    start_time = time.time()
+    clear_cruise_cache()
+    fuel_liters = run_segment_simulation(final_drive_ratio)
+    end_time = time.time()
+    cost = fuel_liters
+
+    if fuel_liters == 0.0:
+        print(f"  FD: {final_drive_ratio:.3f} | Simulation FAILED (Cost: 0.0 L) "
+              f"| Time: {end_time - start_time:.2f}s")
+        return float('inf')
+
+    print(f"  FD: {final_drive_ratio:.3f} | Cost: {cost:.5f} L "
+          f"| Time: {end_time - start_time:.2f}s")
+    return cost
+
+
+# --- 9. ROUTE MAPPER FUNCTIONS ---
+
+def get_route_from_ors(start_coords, end_coords, api_key):
+    """Get route data from OpenRouteService (ORS) API."""
+    print(f"🗺️  Getting route from {start_coords} to {end_coords} via ORS...")
+
+    start_ors = [start_coords[1], start_coords[0]]
+    end_ors = [end_coords[1], end_coords[0]]
+
+    url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
+    headers = {
+        "Authorization": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/geo+json"
+    }
+    body = {
+        "coordinates": [start_ors, end_ors],
+        "preference": "fastest",
+        "elevation": True,
+        "instructions": False,
+        "geometry_simplify": "false"
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=60)
+        print(f"   API Status: {response.status_code}")
+
+        if response.status_code != 200:
+            print(f"❌ ORS API Error: {response.text}")
+            return None
+
+        data = response.json()
+        if 'features' not in data or len(data['features']) == 0:
+            print("❌ No route found between these coordinates")
+            return None
+
+        # --- Parse Geometry (Path & Elevation) ---
+        coords = data["features"][0]["geometry"]["coordinates"]
+        if len(coords[0]) == 3:
+            df = pd.DataFrame(coords, columns=["lon", "lat", "elev_m"])
+            print(f"   ✅ Route found: {len(df)} points with REAL elevation")
+        else:
+            df = pd.DataFrame(coords, columns=["lon", "lat"])
+            df["elev_m"] = 0.0  # Fallback
+            print(f"   ✅ Route found: {len(df)} points (no elevation data)")
+
+        return df
+
+    except Exception as e:
+        print(f"❌ ORS API call failed: {e}")
+        return None
+
+
+def apply_manual_speed_limits(df_route):
+    """Applies user-defined speed limit logic using configured constants."""
+    print("   - Applying manual speed limit logic...")
+
+    # Calculate the cumulative distance in km for each point
+    df_route['cumulative_distance_km'] = (
+        df_route['distance_to_next_m'].cumsum() / 1000.0
+    )
+
+    # Get the total route distance
+    total_route_distance_km = df_route['cumulative_distance_km'].iloc[-1]
+
+    conditions = []
+    choices = []
+
+    # 1. END OF ROUTE RULES (Highest Priority)
+    for dist_from_end, speed_mph in MANUAL_SPEED_LIMITS_END:
+        cut_off_point = total_route_distance_km - dist_from_end
+        conditions.append(df_route['cumulative_distance_km'] > cut_off_point)
+        choices.append(speed_mph)
+
+    # 2. START OF ROUTE RULES (Lower Priority)
+    for dist_from_start, speed_mph in MANUAL_SPEED_LIMITS_START:
+        conditions.append(df_route['cumulative_distance_km'] <= dist_from_start)
+        choices.append(speed_mph)
+
+    # The 'default' is the highway speed
+    df_route['speed_limit_mph'] = np.select(
+        conditions, choices, default=SPEED_LIMIT_DEFAULT_MPH
+    )
+
+    print("   - Manual speed limits applied.")
+    return df_route
+
+
+def print_route_summary(df_route):
+    """Print comprehensive summary of the route."""
+    print("\n" + "=" * 60)
+    print("📊 ROUTE SUMMARY")
+    print("=" * 60)
+
+    total_points = len(df_route)
+    total_distance_m = df_route['distance_to_next_m'].sum()
+    total_distance_miles = total_distance_m / 1609.34
+
+    print(f"Total Points: {total_points}")
+    print(f"Total Distance: {total_distance_m / 1000:.2f} km "
+          f"({total_distance_miles:.2f} miles)")
+    print(f"Elevation Range: {df_route['elev_m'].min():.1f}m to "
+          f"{df_route['elev_m'].max():.1f}m")
+
+    # Speed limit distribution
+    speed_stats = df_route['speed_limit_mph'].value_counts().sort_index()
+    print(f"\nSpeed Limit Distribution (MPH):")
+    print("-" * 35)
+    for speed, count in speed_stats.items():
+        percentage = (count / total_points) * 100
+        kmh_equivalent = mph_to_kmh(speed)
+        print(f"  {speed} mph ({kmh_equivalent} km/h): "
+              f"{count} points ({percentage:.1f}%)")
+
+    avg_speed_limit_mph = df_route['speed_limit_mph'].mean()
+    avg_speed_limit_kmh = mph_to_kmh(avg_speed_limit_mph)
+    print(f"\nAverage Speed Limit: {avg_speed_limit_mph:.1f} mph "
+          f"({avg_speed_limit_kmh:.1f} km/h)")
+
+
+def create_route_file():
+    """Main function to fetch and process the route."""
+    print("=" * 50)
+    print("🚗 1. RUNNING ROUTE MAPPER")
+    print("=" * 50)
+
+    print(f"\n📍 Hard-coded route: Edinburgh {START_COORDS} → Glasgow {END_COORDS}")
+    print("\n1. Fetching route data from ORS API...")
+    df_route = get_route_from_ors(START_COORDS, END_COORDS, API_KEY)
+
+    if df_route is not None:
+        print("\n2. Processing route data...")
+        df_processed = calculate_point_distances(df_route)
+
+        # 3. Add *Manual* Speed Limits
+        df_processed = apply_manual_speed_limits(df_processed)
+
+        # 4. Save Final CSV
+        df_processed.to_csv(OUTPUT_FILENAME, index=False)
+        print(f"\n✅ Successfully saved final route data to '{OUTPUT_FILENAME}'")
+
+        # 5. Print Summary
+        print_route_summary(df_processed)
+
+        # Show sample of the enhanced data
+        print(f"\n📋 Sample of final data (first 5 points):")
+        print(df_processed.head().to_string(index=False))
+        return True
+
+    else:
+        print("❌ Route generation failed. Exiting.")
+        return False
+
+
+# --- 10. TOP SPEED & GRADIENT FINDER (ROOT FINDING) ---
+
+def _root_find_function(speed_mps, gear, slope_percent,
+                        final_drive_ratio, get_max_torque_at_rpm):
+    """
+    The f(x) for Newton-Raphson.
+    Returns Net Force (Tractive - Resistance). Target is 0.
+    """
+    if speed_mps < 0:
+        return 1e9  # Disallow negative speeds
+
+    # Calculate Tractive Force at WOT
+    gear_ratio = FIXED_GEAR_RATIOS_DICT[gear]
+    current_rpm = get_engine_rpm_from_speed(
+        speed_mps, gear_ratio, final_drive_ratio
+    )
+    max_engine_torque = get_max_torque_at_rpm(current_rpm)
+    total_reduction = gear_ratio * final_drive_ratio
+    f_tractive = (max_engine_torque * total_reduction) / TIRE_RADIUS_M
+
+    # Calculate Resistance Force
+    f_resistance = calculate_resistance_forces(speed_mps, slope_percent)
+
+    f_net = f_tractive - f_resistance
+    return f_net
+
+
+def _root_find_derivative_numeric(f, speed_mps, args, h=0.01):
+    """
+    Calculates f'(x) numerically (central difference).
+    f'(x) ≈ ( f(x+h) - f(x-h) ) / 2h
+    """
+    f_plus_h = f(speed_mps + h, *args)
+    f_minus_h = f(speed_mps - h, *args)
+
+    # Handle division by zero
+    if (2 * h) == 0:
+        return 0.0
+
+    return (f_plus_h - f_minus_h) / (2 * h)
+
+
+def newton_raphson_solver(f, f_prime, x0, args=(), tol=0.01, max_iter=50):
+    """Manual implementation of the Newton-Raphson algorithm."""
+    x_n = x0
+    for i in range(max_iter):
+        f_x = f(x_n, *args)
+        if abs(f_x) < tol:
+            return x_n  # Success!
+        f_prime_x = f_prime(f, x_n, args=args)
+        if f_prime_x == 0:
+            print(f"  Newton-Raphson failed: derivative is zero.")
+            return None
+        x_n = x_n - (f_x / f_prime_x)
+    print(f"  Newton-Raphson failed to converge after {max_iter} iterations.")
+    return None
+
+
+def find_top_speed(final_drive_ratio, gear, slope_percent, get_max_torque_func):
+    """Wrapper for the Newton-Raphson root finder for Speed."""
+    initial_guess_kmh = 200.0
+    initial_guess_mps = initial_guess_kmh / 3.6
+    args_tuple = (gear, slope_percent, final_drive_ratio, get_max_torque_func)
+
+    try:
+        top_speed_mps = newton_raphson_solver(
+            _root_find_function,
+            _root_find_derivative_numeric,
+            initial_guess_mps,
+            args=args_tuple
+        )
+
+        if top_speed_mps is not None:
+            return top_speed_mps * 3.6  # Return km/h
+        else:
+            return 0.0  # Solver failed
+
+    except Exception as e:
+        print(f"  Error in root finding: {e}")
+        return 0.0
+
+
+# --- 11. PROBLEM 2: FIND MAX SLOPE (GRADEABILITY) ---
+
+def _find_max_slope_f(slope_percent, speed_mps, gear,
+                      final_drive_ratio, get_max_torque_at_rpm):
+    """This is the f(x) for the Max Slope problem. We solve for slope."""
+
+    # Calculate Tractive Force at WOT (this is now a constant)
+    gear_ratio = FIXED_GEAR_RATIOS_DICT[gear]
+    current_rpm = get_engine_rpm_from_speed(
+        speed_mps, gear_ratio, final_drive_ratio
+    )
+    max_engine_torque = get_max_torque_at_rpm(current_rpm)
+    total_reduction = gear_ratio * final_drive_ratio
+    f_tractive = (max_engine_torque * total_reduction) / TIRE_RADIUS_M
+
+    # Calculate Resistance Force (this is now the variable)
+    f_resistance = calculate_resistance_forces(speed_mps, slope_percent)
+
+    return f_tractive - f_resistance
+
+
+def find_max_slope(final_drive_ratio, gear, speed_kmh):
+    """Wrapper for the Newton-Raphson solver for max slope."""
+    initial_guess_slope = 5.0  # Guess 5% grade
+    speed_mps = speed_kmh / 3.6
+    args_tuple = (speed_mps, gear, final_drive_ratio, get_max_torque)
+
+    max_slope_pct = newton_raphson_solver(
+        _find_max_slope_f,
+        _root_find_derivative_numeric,
+        initial_guess_slope,
+        args=args_tuple
+    )
+
+    if max_slope_pct is not None:
+        return max_slope_pct
+    else:
+        return 0.0  # Solver failed
+
+
+# --- 13. MAIN EXECUTION ---
+
+if __name__ == "__main__":
+    try:
+        # --- TASK 1: SETUP ENGINE ---
+        print("--- TASK 1: SETTING UP ENGINE MODEL ---")
+        setup_engine_model()
+
+        # --- TASK 2: CREATE ROUTE FILE ---
+        print("\n--- TASK 2: CREATING ROUTE FILE ---")
+        if not create_route_file():  # This now calls the MANUAL mapper
+            raise SystemExit(
+                "\n🛑 Halting execution. Route file could not be generated."
+            )
+
+        # --- TASK 3: PROCESS ROUTE FILE ---
+        print("\n--- TASK 3: PRE-PROCESSING ROUTE FOR SIMULATION ---")
+        if not preprocess_route():
+            raise SystemExit(
+                "\n🛑 Halting execution. Route file could not be processed."
+            )
+
+        # --- TASK 4: RUN OPTIMIZATION ---
+        print("\n--- TASK 4: RUNNING HYBRID OPTIMIZATION ---")
+
+        print("\nCalculating baseline fuel economy with initial ratio:")
+        baseline_fuel = objective_function(BASE_FINAL_DRIVE_RATIO)
+
+        optimal_ratio = BASE_FINAL_DRIVE_RATIO  # Default to baseline
+
+        if baseline_fuel == float('inf'):
+            print("ERROR: Baseline simulation failed. Cannot proceed.")
+        else:
+            print(f"Baseline Fuel Consumption: {baseline_fuel:.5f} Liters")
+            print("\n--- STARTING 1D OPTIMIZATION ---")
+
+            result = minimize_scalar(
+                objective_function,
+                bounds=(2.0, 4.5),  # Search between these final drive ratios
+                method='bounded',
+                options={'xatol': 0.01}  # Find answer within 0.01 ratio
+            )
+
+            print("\n--- OPTIMIZATION COMPLETE ---")
+
+            if result.success:
+                optimal_ratio = result.x
+                final_fuel_cost = result.fun
+                print(f"Baseline Ratio: {BASE_FINAL_DRIVE_RATIO:.3f} | "
+                      f"Fuel: {baseline_fuel:.5f} L")
+                print(f"Optimal Ratio:  {optimal_ratio:.3f} | "
+                      f"Fuel: {final_fuel_cost:.5f} L")
+                
+                fuel_saved = baseline_fuel - final_fuel_cost
+                percent_saved = (fuel_saved / baseline_fuel) * 100
+                print(f"\nFuel Saved: {fuel_saved:.5f} L "
+                      f"({percent_saved:.2f}% improvement)")
+            else:
+                print("Optimization did not converge.")
+
+        # --- TASK 5: RUN TOP SPEED ANALYSIS (ROOT FINDING) ---
+        print("\n--- TASK 5: RUNNING TOP SPEED ANALYSIS (NEWTON-RAPHSON) ---")
+
+        print(f"\nTesting BASELINE Final Drive: {BASE_FINAL_DRIVE_RATIO:.3f}")
+        top_speed_base = find_top_speed(
+            BASE_FINAL_DRIVE_RATIO, 6, 0.0, get_max_torque
+        )
+        print(f"  > Top Speed (6th Gear, 0% Slope): {top_speed_base:.1f} km/h")
+
+        print(f"\nTesting OPTIMAL Final Drive: {optimal_ratio:.3f}")
+        top_speed_opt = find_top_speed(optimal_ratio, 6, 0.0, get_max_torque)
+        print(f"  > Top Speed (6th Gear, 0% Slope): {top_speed_opt:.1f} km/h")
+
+        # --- TASK 6: RUN MAX SLOPE (GRADEABILITY) ANALYSIS ---
+        print("\n--- TASK 6: RUNNING MAX SLOPE ANALYSIS (NEWTON-RAPHSON) ---")
+
+        SPEED_TO_TEST = 70.0  # 70 mph
+        SPEED_TO_TEST_MPS = SPEED_TO_TEST * MPH_TO_MPS
+        GEAR_TO_TEST = 4  # A good climbing gear
+
+        print(f"\nTesting BASELINE Final Drive: {BASELINE_RATIO:.3f}")
+        max_slope_base = find_max_slope(
+            BASELINE_RATIO, GEAR_TO_TEST, SPEED_TO_TEST_MPS * 3.6
+        )
+        print(f"  > Max Climbable Grade at {SPEED_TO_TEST} mph "
+              f"(Gear {GEAR_TO_TEST}): {max_slope_base:.2f}%")
+
+        print(f"\nTesting 'OPTIMAL' Final Drive: {optimal_ratio:.3f}")
+        max_slope_opt = find_max_slope(
+            optimal_ratio, GEAR_TO_TEST, SPEED_TO_TEST_MPS * 3.6
+        )
+        print(f"  > Max Climbable Grade at {SPEED_TO_TEST} mph "
+              f"(Gear {GEAR_TO_TEST}): {max_slope_opt:.2f}%")
+
+        
+    except ImportError:
+        print("\n--- ERROR ---")
+        print("This script requires 'numpy', 'matplotlib', 'scipy', 'pandas', "
+              "and 'requests'.")
+        print("Please install them by running:")
+        print("pip install numpy matplotlib scipy pandas requests")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
