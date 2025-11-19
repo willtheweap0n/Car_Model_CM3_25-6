@@ -1,6 +1,6 @@
 # Car_Model_CM3_25-6
 
-We are modelling a car to drive a given route at the optimal speed. We are optimising for least time spent travelling and maximising fuel conservation. 
+We are modelling a car to drive a given route at the optimal final drive ratio. We are optimising for fuel efficiency. 
 This Python simulation tool models a vehicle traveling on a real-world route (Edinburgh to Glasgow) to determine the Optimal Final Drive Ratio for maximum fuel efficiency.
 Beyond fuel economy, it performs physics-based stress tests to ensure the selected gear ratio does not cripple the vehicle's performance (Top Speed and Hill Climbing ability).
 
