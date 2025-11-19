@@ -53,18 +53,12 @@ Configuration of Car
 Vehicle can be configured for certain specifications, although engine must remain the same for fuel flow data. This can be changed although not much data is available
 .
 the following parameters can be modified for different cars:
-
-Vehicle mass
-
-Frontal area
-
-Drag Coefficient 
-
-Rolling Resistance Coefficient
-
-Wheel radius
-
-Gear Ratios
+vehicle mass,
+frontal area,
+drag Coefficient,
+rolling Resistance Coefficient,
+wheel radius,
+gear Ratios,
 
 Configuration of route:
 
