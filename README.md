@@ -1,9 +1,9 @@
 # Car Model CMM3 Group 3
 We are modelling a car to drive a given route at the optimal final drive ratio. We are optimising for fuel efficiency. This Python simulation tool models a vehicle travelling on a real-world route (Edinburgh to Glasgow) to determine the Optimal Final Drive Ratio for maximum fuel efficiency. Beyond fuel economy, it performs physics-based stress tests to ensure the selected gear ratio does not cripple the vehicle's performance (Top Speed and Hill Climbing ability).
 
-Prerequisites: User must have Python 3.x and install the libraries numpy, matplotlib, requests, scipy and pandas. If the route is going to be changed, then a new API key may be needed. This can be done by registering with openrouteservice.org
+Prerequisites: User must have Python 3.x and install the libraries numpy, matplotlib, requests, scipy and pandas. If the route is going to be changed, then a new API key may be needed. This can be done by registering with openrouteservice.org. If libraries are not installed the code from libraries installer can be run to check installed libraries and install required libraries.
 
-To run code, simply download and run the FDR Optimisation.ipynb file to a python notebook and run. During the process of running this code, the file final_route_data.csv is created. This data is then used to create the route segments. As the code creates this file during its run, there should be no need to download this file. As a precaution, we have left the file on GitHub. If errors occur while running the code, this file can be downloaded separately.
+To run code, simply download and run the FDR Optimisation.ipynb file to a python notebook and run (if libraries are already installed), if libraries are not already installed please take code from "libraries installer" and run in a python notebook. During the process of running this code, the file final_route_data.csv is created. This data is then used to create the route segments. As the code creates this file during its run, there should be no need to download this file. As a precaution, we have left the file on GitHub. If errors occur while running the code, this file can be downloaded separately.
 
 Section 1: configuration (line 13) section of the code. Defines the constants, vehicle data, and route information.
 
