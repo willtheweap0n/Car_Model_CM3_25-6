@@ -6,21 +6,43 @@ Beyond fuel economy, it performs physics-based stress tests to ensure the select
 
 To run code simply run the python script.
 
-Our code can be seperated into blocks
+Section 1: configuration (line 13)
+section one of the code defines the constants, vehicle data, and route information.
 
-Real-World Route Mapping: Uses the OpenRouteService (ORS) API to fetch real path geometry and elevation data.
+Section 2: Helper Functions (line 69)
+This includes helper functions used to calculate distance between route points.
+and convert between mph and kph.
 
-Engine Efficiency Mapping: Uses interpolated BSFC (Brake Specific Fuel Consumption) data based on EPA engine logs.
+Section 3: Core engine Model. (interpolation)(line 109)
+Using bivariate spline this interpolates fuel flow data to model the engine of our car and return a fuel flow map. This data also includes a line for wide open throttle and closed throttle. This is used to find fuel use for given torques and speeds.
 
-Hybrid Physics Simulation: Combines ODE solvers (for acceleration events) with algebraic resistance models (for cruising) to calculate fuel flow.
+Section 4: Core Physics Functions (line 195)
+This contains functions that return the engine rpm from car speed and drive ratio. As well as calculation of total resistive forces.
 
-Geometric Optimization: Uses scipy.optimize to find the exact Final Drive Ratio that minimizes fuel usage over the specific route.
+Section 5: route pre-processing (line 215)
+This contains functions that will process the route data into usable segments.
 
-Performance Analysis: Uses Newton-Raphson root-finding algorithms to calculate:
+Section 6: Hybrid Simulation functions (ODE) (line 260)
+This contains a function to be used when car is at constant speed to calculate df/dt for segments of the route where car speed is not changing.
+Also contains acceleration function used when car is accelerating. This uses an ODE to calculate the changing velocity of the car while at 80% of max torque until speed limit is reached, which is then used to find df/dt. This is done by calling section 3 to find fuel use for given torques and speeds
 
-Top Speed (at 0% gradient).
+Section 7: Hybrid Engine Simulation (line 382)
+This contains a function which runs the two hybrid simulation functions over the segments of the route.
 
-Max Gradeability (max slope climbable at highway speeds).
+Section 8: Optimization (line 431)
+function that defines the objectives of the optimization
+
+Section 9: Route Mapper (line 451)
+Obtains route data from open route services using start and end coordinates and creates file. Also applies manual speed limits to data. 
+
+Section 10: Top Speed finder (line 605)
+Defines newton raphson solver, and top speed finder.
+
+Section 11: Max gradient finder (line 687)
+Defines function finding max gradient at 70 mph
+
+Section 12: main execution
+Executes functions in correct order.
 
 Prerequisites. 
 User must have Python 3.x and install the libraries numpy, matplotlib, requests, scipy, pandas
