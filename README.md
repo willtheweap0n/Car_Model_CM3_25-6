@@ -4,7 +4,8 @@ We are modelling a car to drive a given route at the optimal final drive ratio. 
 This Python simulation tool models a vehicle traveling on a real-world route (Edinburgh to Glasgow) to determine the Optimal Final Drive Ratio for maximum fuel efficiency.
 Beyond fuel economy, it performs physics-based stress tests to ensure the selected gear ratio does not cripple the vehicle's performance (Top Speed and Hill Climbing ability).
 
-To run code simply run the python script in the FDR Optimisation file.
+To run code simply run the python script in the FDR Optimization file. During the process of running this code the file final_route_data.csv is created. This data is then used to create the route segments. As the code creates this file during its run there should be no need to download this file.
+
 
 Section 1: configuration (line 13)
 section one of the code defines the constants, vehicle data, and route information.
