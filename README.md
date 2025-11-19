@@ -1,6 +1,8 @@
 # Car Model CMM3 Group 3
 We are modelling a car to drive a given route at the optimal final drive ratio. We are optimising for fuel efficiency. This Python simulation tool models a vehicle travelling on a real-world route (Edinburgh to Glasgow) to determine the Optimal Final Drive Ratio for maximum fuel efficiency. Beyond fuel economy, it performs physics-based stress tests to ensure the selected gear ratio does not cripple the vehicle's performance (Top Speed and Hill Climbing ability).
 
+Prerequisites: User must have Python 3.x and install the libraries numpy, matplotlib, requests, scipy and pandas. If the route is going to be changed, then a new API key may be needed. This can be done by registering with openrouteservice.org
+
 To run code, simply download and run the FDR Optimisation.ipynb file to a python notebook and run. During the process of running this code, the file final_route_data.csv is created. This data is then used to create the route segments. As the code creates this file during its run, there should be no need to download this file. As a precaution, we have left the file on GitHub. If errors occur while running the code, this file can be downloaded separately.
 
 Section 1: configuration (line 13) section of the code. Defines the constants, vehicle data, and route information.
@@ -27,7 +29,6 @@ Section 11: Max gradient finder (line 687) Defines a function finding the max gr
 
 Section 12: Main execution (727) Executes functions in correct order.
 
-Prerequisites. User must have Python 3.x and install the libraries numpy, matplotlib, requests, scipy and pandas. If the route is going to be changed, then a new API key may be needed. This can be done by registering with openrouteservice.org
 
 # Configuration of the Car:
 The vehicle can be configured for certain specifications, although the engine must remain the same for fuel flow data. This can be changed, although not much data is available. The following parameters can be modified for different cars: vehicle mass, frontal area, drag Coefficient, rolling Resistance Coefficient, wheel radius, gear Ratios.
