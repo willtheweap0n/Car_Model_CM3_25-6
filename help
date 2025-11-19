@@ -684,7 +684,7 @@ def find_top_speed(final_drive_ratio, gear, slope_percent, get_max_torque_func):
         return 0.0
 
 
-# --- 11. PROBLEM 2: FIND MAX SLOPE (GRADEABILITY) ---
+# --- 12. PROBLEM 2: FIND MAX SLOPE (GRADEABILITY) ---
 
 def _find_max_slope_f(slope_percent, speed_mps, gear,
                       final_drive_ratio, get_max_torque_at_rpm):
